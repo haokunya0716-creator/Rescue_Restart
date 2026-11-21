@@ -35,6 +35,7 @@ enable_language(C ASM)
 add_executable(${CMAKE_PROJECT_NAME}
 
 
+
 )
 
 # Add STM32CubeMX generated sources
@@ -92,22 +93,12 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 
         MyLib/DRV8701/drv8701.c
         MyLib/DRV8701/drv8701.h
-        App_Task/App_Task.c
-        App_Task/App_Task.h
-        App_Task/app_task_config.h
-        App_Task/app_task_move.c
-        App_Task/app_task_vision.c
-        App_Task/app_task_scatter.c
-        App_Task/app_zone_y_test.c
-        App_Task/app_zone_y_test.h
-        App_Task/app_zone_xy_heading_test.c
-        App_Task/app_zone_xy_heading_test.h
-
-
         User_gx/Oled_ssd/oled_hardware_i2c.c
         User_gx/Oled_ssd/oled_hardware_i2c.h
         User_gx/Oled_ssd/oledfont.h
 
+        App_Task/App_Task.c
+        App_Task/App_Task.h
 )
 
 # Add include paths
@@ -124,8 +115,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
         MyLib/Inc
         MyLib/Src
         MyLib/DRV8701
+        User_gx/Oled_ssd
         App_Task
-         User_gx/Oled_ssd
 
 )
 

@@ -12,9 +12,9 @@ static Button_TypeDef userKey1; // 用户按钮
 static Button_TypeDef userKey2;
 static Button_TypeDef userKey3;
 
-int key1_flag;//单击调试标志，不启动任务
-int key2_flag;//单击选择蓝方并启动
-int key3_flag;//单击选择红方并启动
+int key1_flag;
+int key2_flag;
+int key3_flag;
 
 static void OnUserKey_Clicked1(uint8_t clicks);
 static void OnUserKey_Clicked2(uint8_t clicks);

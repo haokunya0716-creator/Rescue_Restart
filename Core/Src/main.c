@@ -36,18 +36,9 @@
 #include "app_servo.h"
 #include "app_motor.h"
 #include "app_speed.h"
-#include "app_line_pid.h"
+#include "App_Task.h"
 #include "JY901S.h"
 #include "rescue_usart2.h"
-#include "App_Task.h"
-#include "app_task_config.h"
-#include "oled_hardware_i2c.h"
-#include <stdio.h>
-#include "app_cargo_test.h"
-#include "app_zone_test.h"
-#include "app_zone_y_test.h"
-#include "app_zone_xy_heading_test.h"
-#include "app_vision_test.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -68,7 +59,7 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-uint8_t rx_byte_imu;   // 串口6接收陀螺仪数据
+uint8_t rx_byte_imu;   // USART3 接收陀螺仪数据
 /*
  *调试用变量
  */
@@ -76,9 +67,6 @@ float duty_l = 0;
 float duty_r = 0;
 float angle_1 = 0.0f;
 float angle_2 = 0.0f;
-extern int key1_flag;//调试按键，不启动任务
-extern int key2_flag;//蓝方任务启动
-extern int key3_flag;//红方任务启动
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -134,27 +122,9 @@ int main(void)
   MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
 
-  /*
-   * 所有定时器和 GPIO 初始化完成后，启动 DRV8701E 的两路 EN PWM。
-   * Motor_Init() 会先写入停止值，避免上电初始化过程中产生
-   * 意外的电机动作。
-   */
-  Motor_Init();
-  Motor_Cmd(1);
+  HAL_UART_Receive_IT(&huart3, &rx_byte_imu, 1);//开启串口中断
 
-  /* 控制目标和闭环模式由 STM32 本地业务层选择，视觉串口只提供场景。 */
-  App_Speed_Init();
-  App_Motor_Init();
-  App_LinePID_Init(); // 视觉对准 PID 初始化，SP 为屏幕中心 x
-
-  App_Servo_Init();//初始化舵机
-  App_Button_Init();//初始化三个按键的单击回调：KEY2蓝方、KEY3红方
-  HAL_UART_Receive_IT(&huart3, &rx_byte_imu, 1);//陀螺仪接收初始化
-
-  // OLED_Init();//oled初始化并且显示信息
-  // OLED_ShowString(0, 0, (uint8_t *)"angle", 8);
-
-
+  App_Task_Init();//其他的相关初始化
   /*
    * TIM1 以 1 MHz 计数并开启更新中断，供 gx_GetUs() 提供
    * 64 位微秒时间戳。TIM1 的自动重装载值为 65535，因此每次
@@ -170,7 +140,6 @@ int main(void)
     Error_Handler();
   }
   App_USART1_Printf("start!\n");
-  //App_USART2_Printf("start!\n");
 
   /* USER CODE END 2 */
 
@@ -178,16 +147,7 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    //if (App_ZoneXYHeading_Test(APP_TASK_TEAM_RED, 69.9f)) { continue; } // 新XY+固定航向测试；0.0f改为场地标定角，与下方测试仅启用一个。
-    //if (App_ZoneY_Test(APP_TASK_TEAM_RED)) { continue; } // 独立安全区Y轴PID调参；注释本行恢复下方模式。
-    // if (App_Zone_Test(APP_TASK_TEAM_RED)) { continue; } // 原完整安全区XY测试。
-    if (key2_flag == 1 || key3_flag == 1) {
-      uint8_t team = key3_flag == 1 ? APP_TASK_TEAM_RED : APP_TASK_TEAM_BLUE;
-      key2_flag = 0;
-      key3_flag = 0;
-      App_Task_Start(team);
-    }
-    App_Usart_USB_Process();//USB虚拟串口通信
+    App_Usart_USB_Process();
     PERIODIC_START(KEY_DETECT,20)
     App_Button_Proc();
     PERIODIC_END
@@ -196,16 +156,8 @@ int main(void)
     HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
     PERIODIC_END
 
-    /* oled
-     * 每 100 ms 显示偏航角，并检查两路舵机的设定角度。
-     * 6×8 小字体每行占一页：偏航角 y=1，夹爪 y=2，摄像头 y=3。
-     */
-
-    /* 先更新视觉场景，再执行本地任务和当前步骤需要的控制闭环。 */
     Rescue_Usart2_Process();
-    //App_Vision_Test(); // 每50 ms打印视野内全部检测信息；不用时注释本行。
-    App_Task_Proc();
-    Rescue_Usart2_Debug_Proc(); // 正式模式下串口1报告相机断流超时。
+    Rescue_Usart2_Debug_Proc();
 
     /* USER CODE END WHILE */
 
@@ -267,7 +219,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     HAL_UART_Receive_IT(&huart3, &rx_byte_imu, 1);
   } else if (huart->Instance == USART2) {
     /* USART2 的组帧和缓存由协议模块负责；这里不执行电机或舵机动作。 */
-    extern void Rescue_Usart2_RxCallback(void);
     Rescue_Usart2_RxCallback();
   }
 }

@@ -6,7 +6,7 @@
 
 #define RESCUE_VISION_TIMEOUT_MS 500U
 
-#define RESCUE_DEBUG_ENABLE     1U   /* 1：串口1报告接收超时；0：关闭该提示，视觉接收及任务日志不受影响。 */
+#define RESCUE_DEBUG_ENABLE     1U   /* 1：串口1报告接收超时；0：关闭该提示，视觉接收不受影响。 */
 #define RESCUE_RX_TIMEOUT_MS    10000U /* 串口2连续多久未收到任何字节时打印uart_error，单位ms；收到任意字节重新计时。 */
 
 /* MX_USART2_UART_Init() 后调用一次，开始 USART2 单字节中断接收。 */

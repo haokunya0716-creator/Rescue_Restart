@@ -32,7 +32,7 @@ void App_Servo_Init(void) {
 
     /* 先加载两路初始脉宽，再开启输出，避免先输出零脉宽。 */
     App_Servo_SetAngle(&servo_1, 180.0f);
-    App_Servo_SetAngle(&servo_2, 45.0f);
+    App_Servo_SetAngle(&servo_2, 50.0f);
 
     HAL_TIM_PWM_Start(servo_1.htim, servo_1.Channel);
     HAL_TIM_PWM_Start(servo_2.htim, servo_2.Channel);

@@ -12,8 +12,9 @@ typedef enum { // 定义各动作模块统一使用的步骤结果枚举。
     APP_STEP_WAIT = 0, // 等待新画面或机械稳定，保持当前安全状态
     APP_STEP_RUNNING,  // 动作进行中，主循环继续调用
     APP_STEP_DONE,     // 本步骤完成，由任务层决定下一步
-    APP_STEP_FAILED,   // 异常结束，运动模块已停车
-    APP_STEP_RESEARCH  // 安全区跟随条件失配，已立即转入旋转搜索，由上层切换状态。
+    APP_STEP_FAILED,   // 本步骤未通过；运动动作已停车，复检由任务层重试或恢复。
+    APP_STEP_RESEARCH, // 安全区丢失/确认失败，交任务层发新视角并旋转重搜。
+    APP_STEP_TARGET_LOST // 普通绿色确认丢失，已停轮，由任务层后退再重搜。
 } App_Task_Result; // 将以上步骤结果命名为App_Task_Result，供任务状态机判断。
 
 // @简介：撤销位置/角度控制并停止双轮，不修改任务状态和载物标志。
@@ -43,8 +44,5 @@ void App_Task_Frame_Set(uint8_t down); // 声明接口：设置一号前框角�
 
 // @简介：设置二号摄像头角度；down=1低头复检，down=0正常观察，同时更新舵机结构体。
 void App_Task_Camera_Set(uint8_t down); // 声明接口：设置二号摄像头角度；down=1低头复检，down=0正常观察，同时更新舵机结构体。
-
-// @简介：退离物资区后的新循环接口，目前留空；不能把抬框直接当成首运成功。
-void App_Task_NextCycle_Proc(void); // 声明接口：退离物资区后的新循环接口，目前留空；不能把抬框直接当成首运成功。
 
 #endif // 结束本头文件的重复包含保护。

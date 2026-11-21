@@ -97,8 +97,11 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
         App_Task/app_task_config.h
         App_Task/app_task_move.c
         App_Task/app_task_vision.c
-        App_Task/app_task_zone.c
         App_Task/app_task_scatter.c
+        App_Task/app_zone_y_test.c
+        App_Task/app_zone_y_test.h
+        App_Task/app_zone_xy_heading_test.c
+        App_Task/app_zone_xy_heading_test.h
 
 
         User_gx/Oled_ssd/oled_hardware_i2c.c

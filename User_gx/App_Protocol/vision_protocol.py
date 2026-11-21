@@ -78,8 +78,8 @@ def encode_scene(*, sequence, frame_id, capture_ms, view_id, image_width,
             if obj.track_id in ids:
                 raise ValueError("duplicate track ID")
             ids.add(obj.track_id)
-        if not 0 <= obj.type <= OBJECT_SAFE_ZONE_DIVIDER or not 0 <= obj.confidence <= 100:
-            raise ValueError("invalid type/confidence")
+        if not 0 <= obj.type <= OBJECT_SAFE_ZONE_DIVIDER:
+            raise ValueError("invalid type")
         if not 0 < obj.width <= image_width or not 0 < obj.height <= image_height:
             raise ValueError("invalid box size")
         xmin, ymin = obj.cx - obj.width // 2, obj.cy - obj.height // 2

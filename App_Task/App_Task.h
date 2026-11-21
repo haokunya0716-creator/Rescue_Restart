@@ -12,6 +12,9 @@
 // @参数 team：APP_TASK_TEAM_RED或APP_TASK_TEAM_BLUE；重试不重置本轮3分钟计时。
 void App_Task_Start(uint8_t team); // 声明接口：选择队伍并启动；仅空闲且未落框时接受，运行中忽略切队/重启。
 
+// 开机测试入口：建立同一整轮计时，落框等待后直接进入正式安全区状态机。
+void App_Task_StartZoneTest(uint8_t team);
+
 // @简介：任务执行状态机，在while(1)中持续调用；只安排步骤，不包含底层动作算法。
 void App_Task_Proc(void); // 声明接口：任务执行状态机，在while(1)中持续调用；只安排步骤，不包含底层动作算法。
 

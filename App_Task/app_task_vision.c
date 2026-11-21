@@ -7,39 +7,42 @@
 #include "app_servo.h" // 引入舵机结构体及角度设置接口。
 #include "app_usart.h" // 引入串口1日志接口，仅在跟随失败时打印原因。
 #include "rescue_usart2.h" // 引入相机场景读取及视角发送接口。
-#include "app_task_zone.h" // 用整体安全区和分界线生成本地分区框。
+#include "app_motor.h" // 整区XY接近暂失期间保持当前航向。
 #include <string.h> // 只用于诊断原因去重及日志分组。
 
 static RescueScene task_scene;       // 相机原始像素快照，不是厘米坐标
-static RescueObject derived_zones[APP_TASK_DERIVED_ZONE_MAX]; // 独立保存分区，不覆盖原始危险物和障碍条目。
-static uint8_t derived_zone_count;
 static RescueObject target;          // 保存目标类型及检测框，不保存列表下标
-static uint16_t target_image_w; // 锁定目标时的实际图像宽度，后续分辨率变化则拒绝跟随。
-static uint16_t target_image_h; // 锁定目标时的实际图像高度，保持跨帧坐标比较基准一致。
+static uint16_t target_image_w; // 最近成功匹配目标所属图像宽度，用于跨分辨率关联。
+static uint16_t target_image_h; // 最近成功匹配目标所属图像高度。
 static uint16_t view_id; // 当前视角编号，换阶段时递增以排除旧视角图像。
 static uint16_t last_frame_id; // 最近已处理图像的帧编号。
 static uint32_t last_capture_ms; // 最近已处理图像的相机采集时间，与帧号一起用于去重。
 static uint32_t view_begin_time; // 当前视角开始时刻，供画面稳定等待使用。
 static uint32_t view_settle_ms; // 本次新视角的画面稳定等待；复检和后退后搜索为0，其它搜索保留配置值。
 static uint32_t view_time; // 上次视角上下文发送尝试时刻，限制重发频率。
-static uint32_t follow_time; // 首次对准或持续接近阶段起点，用于该阶段超时保护。
 static uint8_t view_sent; // 当前视角上下文是否已经成功发送。
 static uint8_t frame_seen; // 本阶段是否接受过图像，静态初值为0。
 static uint8_t verify_frames; // 当前复检窗口已检查的有效新图数量，空区域也占一张，重复帧不累计。
-static uint8_t verify_hits; // 当前三张复检新图中，区域内恰好一个可信绿色的合格张数。
+static uint8_t verify_hits; // 当前三张复检新图中，区域内恰好一个绿色的合格张数。
+static App_Task_VerifyFailure verify_failure; // 当前复检失败分类，新视角开始时清零。
 static uint8_t target_mixed; // 当前锁定是否用于撞散，锁定后不因列表变化而改变用途。
-static uint8_t target_zone; // 当前锁定是否为本队物资分区。
-static uint8_t target_zone_derived; // 当前分区是否由本帧整体区+分界线计算。
+static uint8_t target_zone; // 已锁定本队整块安全区；不跟随分区或分界线。
+static uint8_t zone_missing, zone_stopped; // 本次丢失等待，以及接近丢失是否已进入停车等待。
+static uint32_t zone_missing_time; // 首次判定丢失的时间；坏图和重复图不重置。
+static float zone_drive_speed; // 最近一次实际纵向速度，允许为0或倒车。
+static uint8_t zone_confirming, zone_confirm_frames, zone_confirm_hits;
+static uint32_t zone_confirm_time; // 停车后三图确认的总期限起点。
 static uint8_t follow_forward;        // 首次对准结束后置1，接近时不再置0
 static int8_t capture_y_direction; // 单独绿色纵向实际控制方向：前进1、倒车-1、停车0。
 static int8_t capture_y_request; // 等待稳定确认的单独绿色纵向方向。
 static uint8_t capture_y_frames; // 同一请求方向连续出现的新图计数。
 static uint32_t capture_y_wait_time; // 进入停车/换向等待的起始时刻。
-static uint8_t team_supply_type; // 本队物资放置分区的视觉协议类型，按队伍颜色初始化。
+static uint8_t team_zone_type; // 本队整块安全区的视觉协议类型，红5/蓝6。
 static float camera_angle = SERVO2_LIFT; // 本阶段期望的摄像头俯角，默认正常观察角，并非实测反馈。
 static uint8_t search_empty_frames;   // 本侧连续无候选的新帧数量
 static uint8_t lost_frames;           // 只统计未匹配原目标的有效新帧
 static uint32_t lost_time;            // 第一次短暂丢失时间，不延长总接近超时
+static uint8_t green_waiting;         // 坏图和有效新图失配共用等待起点，独立于丢失帧数
 static uint8_t arrive_frames;         // 停车后连续到位确认，不重复计算同帧
 static uint32_t arrive_time; // 当前一轮到位停车确认的计时起点。
 static float arrive_x; // 当前一轮到位确认的目标中心x位置基准。
@@ -49,24 +52,18 @@ static float arrive_y; // 当前一轮到位确认的目标中心y位置基准�
 static const char *scene_reason = "not_checked";
 static const char *match_reason = "not_checked";
 static const char *cargo_reason = "not_checked";
-static const char *zone_reason = "not_checked";
 static const char *scatter_reason = "not_checked";
 static const char *verify_wait = "new_view";
 static const char *select_wait = "new_view";
 static const char *verify_reported;
 static const char *select_reported;
-static const char *zone_reported;
 static uint8_t scene_snapshot; // 1表示本次读图取得了快照；0表示task_scene仅是上次保存值。
 static uint8_t view_send_failed;
 static uint32_t checked_age; // 保存时效检查实际使用的合计年龄。
-static uint8_t match_reject[6]; // 依次为类别、置信度、ID、宽、高、位移拒绝数量。
+static uint8_t match_reject[5]; // 依次为类别、ID、宽、高、位移拒绝数量。
 static float match_best_score, match_second_score;
 static RescueObject diagnostic_target;
-static RescueObject diagnostic_zone_object;
-static uint8_t diagnostic_zone_valid;
 static int cargo_bad_index = -1;
-static int zone_bad_index = -1;
-static int zone_path_index = -1;
 static int scatter_bad_index = -1;
 static uint8_t cargo_count;
 static uint16_t verify_new_total, verify_duplicates, verify_invalid;
@@ -80,11 +77,10 @@ static void App_Task_LogWait(const char *stage, const char *reason, const char *
     *reported = reason;
 }
 
-// 原始条目下标不变；本地分区接在原始条目后，仅供分区选择、跟随和通道检查。
+// 按原始场景下标读取物块，不生成本地分区框。
 static const RescueObject *App_Task_ObjectAt(uint8_t index)
 {
-    return index < task_scene.object_count ? &task_scene.objects[index]
-                                         : &derived_zones[index - task_scene.object_count];
+    return &task_scene.objects[index];
 }
 
 // @简介：返回浮点绝对值，用于像素门限和舵机角度比较。
@@ -156,7 +152,6 @@ static uint8_t App_Task_ImageFresh(void)
 static uint8_t App_Task_ReadScene(void)
 {
     App_Task_UpdateView(); // 保留原发送/重发时序和短路检查顺序。
-    derived_zone_count = 0;
     scene_snapshot = 0;
     if(view_sent == 0){ scene_reason = view_send_failed ? "view_send_failed" : "view_not_sent"; return 0; }
     if(Rescue_Usart2_GetScene(&task_scene) == 0){ scene_reason = "scene_unavailable"; return 0; }
@@ -169,11 +164,10 @@ static uint8_t App_Task_ReadScene(void)
         scene_reason = "camera_angle"; return 0; // 保留原浮点比较语义，包含非数值不通过的情况。
     }
     scene_reason = "ok";
-    derived_zone_count = App_Task_Zone_Derive(&task_scene, derived_zones, APP_TASK_DERIVED_ZONE_MAX);
     return 1;
 }
 
-// @简介：撞散的可见场景检查；最多3件普通/核心物资，低置信或其它实体/区域均拒绝。
+// @简介：撞散的可见场景检查；最多3件普通/核心物资，其它实体/区域均拒绝。
 // @说明：旋转期间也检查整个可见画面；看不到的物块和场地边界仍需后续感知补充。
 static uint8_t App_Task_ScatterSceneClear(void)
 {
@@ -186,9 +180,6 @@ static uint8_t App_Task_ScatterSceneClear(void)
         if(object->type != RESCUE_OBJECT_SUPPLY && object->type != RESCUE_OBJECT_CORE_SUPPLY){
             scatter_reason = "forbidden_type"; scatter_bad_index = i; return 0;
         }
-        if(object->confidence < APP_TASK_CONFIDENCE_MIN){
-            scatter_reason = "low_confidence"; scatter_bad_index = i; return 0;
-        }
         if(++count > APP_TASK_SCATTER_MAX_COUNT){
             scatter_reason = "too_many_supplies"; scatter_bad_index = i; return 0;
         }
@@ -196,34 +187,33 @@ static uint8_t App_Task_ScatterSceneClear(void)
     return 1;
 }
 
-// @简介：锁存目标并复位视觉PID，从下一幅新图开始首次对准；zone=1表示目的分区。
-static void App_Task_Lock(uint8_t index, uint8_t zone, uint8_t mixed) // 函数入口：锁存目标并复位视觉PID，从下一幅新图开始首次对准；zone=1表示目的分区。
+// @简介：锁存目标并复位视觉PID，从下一幅新图开始首次对准；zone=1表示本队整块安全区。
+static void App_Task_Lock(uint8_t index, uint8_t zone, uint8_t mixed) // 函数入口：锁存目标并复位视觉PID，从下一幅新图开始首次对准；zone=1表示本队整块安全区。
 { // 开始App_Task_Lock函数体。
-    target = *App_Task_ObjectAt(index); // 支持相机分区和本地推导分区，不保存列表下标。
-    target_image_w = task_scene.image_width; // 保存锁定时图像宽度，跟随期间不接受分辨率突变。
-    target_image_h = task_scene.image_height; // 保存锁定时图像高度，保证后续坐标关联基准一致。
+    target = *App_Task_ObjectAt(index); // 保存当前目标，不依赖列表下标保持身份。
+    target_image_w = task_scene.image_width; // 保存该目标原始坐标所属的图像尺寸。
+    target_image_h = task_scene.image_height;
     last_frame_id = task_scene.frame_id; // 保存最近处理帧的编号，用于识别重复图像。
     last_capture_ms = task_scene.capture_ms; // 保存最近处理帧的相机采集时间，与帧号共同去重。
     frame_seen = 1; // 记录本阶段已经接受过图像。
-    target_zone = zone; // 记录本次锁定是否用于接近本队物资区。
-    target_zone_derived = zone && index >= task_scene.object_count;
+    target_zone = zone; // 安全区只接近整区，使用独立丢失恢复和三图确认。
     target_mixed = mixed; // 记录本次锁定是单件救援还是物资堆撞散用途。
     follow_forward = 0; // 新锁定目标先进入首次对准，尚未开始持续前进。
     capture_y_direction = 0; // 新目标从停车状态启动纵向控制。
     capture_y_request = 0; // 清除上一个目标遗留的待恢复方向。
     capture_y_frames = 0; // 清空待恢复方向的连续新图计数。
     lost_frames = 0; // 清零原目标连续未匹配的新帧计数。
+    green_waiting = 0;
     arrive_frames = 0; // 清零连续到位确认帧数，禁止继承旧确认结果。
-    follow_time = HAL_GetTick(); // 记录当前首次对准或持续接近阶段的毫秒起点。
     App_LinePID_Reset(); // 清空视觉PID历史误差及死区状态，避免旧输出干扰新阶段。
 } // 结束App_Task_Lock函数体。
 
-// @简介：在新图像中关联已锁定目标（普通/核心物资或本队物资区），失败/歧义返回-1。
+// @简介：在新图像中关联已锁定目标（普通/核心物资），失败/歧义返回-1。
 // @说明：比较本帧同类候选与上一次成功匹配目标的(x,y)，选择平方距离最小者；
 //        不按列表下标、离屏幕中心远近或单独比较x重新选目标，y方向同样参与判断。
 //        默认位移最多70px、框宽高变化不超过两倍；有非零相机ID时还必须同ID。
 //        最近/次近候选得分难以区分时返回失败，交给连续丢失确认，不能强行换锁。
-static int App_Task_MatchTarget(void) // 函数入口：在新图像中关联已锁定目标（普通/核心物资或本队物资区），失败/歧义返回-1。
+static int App_Task_MatchTarget(void) // 函数入口：在新图像中关联已锁定目标（普通/核心物资），失败/歧义返回-1。
 { // 开始App_Task_MatchTarget函数体。
     memset(match_reject, 0, sizeof(match_reject)); // 每幅新图独立记录各类候选拒绝。
     match_reason = "no_candidate";
@@ -232,24 +222,34 @@ static int App_Task_MatchTarget(void) // 函数入口：在新图像中关联已
     int best = -1; // 最佳候选下标初始化为未找到。
     uint8_t i; // 声明遍历场景目标数组的下标。
 
-    if(task_scene.image_width != target_image_w || task_scene.image_height != target_image_h){ // 图像分辨率与原锁定不同则无法可靠比较坐标。
+    uint8_t capture = target_zone == 0 && target_mixed == 0;
+    if(!capture && (task_scene.image_width != target_image_w || task_scene.image_height != target_image_h)){
         match_reason = "image_size_changed";
         return -1; // 返回当前目标不可使用或未能可靠匹配，由调用者按本步骤处理。
     } // 结束条件分支。
-    for(i = 0; i < task_scene.object_count + (target_zone ? derived_zone_count : 0U); i++){
-        const RescueObject *object = App_Task_ObjectAt(i); // 分区跟随同时关联本帧重新推导的框。
-        float dx = ((float)object->cx - target.cx) * APP_TASK_IMAGE_W / task_scene.image_width; // 计算当前候选相对于上次成功匹配目标的归一化水平位移。
-        float dy = ((float)object->cy - target.cy) * APP_TASK_IMAGE_H / task_scene.image_height; // 计算当前候选相对于上次成功匹配目标的归一化垂直位移。
+    for(i = 0; i < task_scene.object_count; i++){
+        const RescueObject *object = App_Task_ObjectAt(i); // 取得相机原始检测框。
+        float dx = ((float)object->cx - target.cx) * APP_TASK_IMAGE_W / task_scene.image_width;
+        float dy = ((float)object->cy - target.cy) * APP_TASK_IMAGE_H / task_scene.image_height;
+        float width = object->width, height = object->height;
+        float previous_width = target.width, previous_height = target.height;
+        if(capture){
+            dx = App_Task_X(object) - target.cx * APP_TASK_IMAGE_W / target_image_w;
+            dy = App_Task_Y(object) - target.cy * APP_TASK_IMAGE_H / target_image_h;
+            width = object->width * APP_TASK_IMAGE_W / task_scene.image_width;
+            height = object->height * APP_TASK_IMAGE_H / task_scene.image_height;
+            previous_width = target.width * APP_TASK_IMAGE_W / target_image_w;
+            previous_height = target.height * APP_TASK_IMAGE_H / target_image_h;
+        }
         float score = dx * dx + dy * dy; // 与上次目标的二维平方距离；不必开平方即可比较远近
 
         if(object->type != target.type){ ++match_reject[0]; continue; }
-        if(object->confidence < APP_TASK_CONFIDENCE_MIN){ ++match_reject[1]; continue; }
-        if(target.track_id != 0 && object->track_id != target.track_id){ ++match_reject[2]; continue; }
-        if(object->width * APP_TASK_TRACK_SIZE_RATIO < target.width
-           || object->width > target.width * APP_TASK_TRACK_SIZE_RATIO){ ++match_reject[3]; continue; }
-        if(object->height * APP_TASK_TRACK_SIZE_RATIO < target.height
-           || object->height > target.height * APP_TASK_TRACK_SIZE_RATIO){ ++match_reject[4]; continue; }
-        if(score > APP_TASK_TRACK_GATE * APP_TASK_TRACK_GATE){ ++match_reject[5]; continue; }
+        if(target.track_id != 0 && object->track_id != target.track_id){ ++match_reject[1]; continue; }
+        if(width * APP_TASK_TRACK_SIZE_RATIO < previous_width
+           || width > previous_width * APP_TASK_TRACK_SIZE_RATIO){ ++match_reject[2]; continue; }
+        if(height * APP_TASK_TRACK_SIZE_RATIO < previous_height
+           || height > previous_height * APP_TASK_TRACK_SIZE_RATIO){ ++match_reject[3]; continue; }
+        if(score > APP_TASK_TRACK_GATE * APP_TASK_TRACK_GATE){ ++match_reject[4]; continue; }
         if(best < 0 || score < best_score){ // 第一个合格候选，或比当前最佳更接近原位置的候选，更新最佳排名。
             second_score = best < 0 ? second_score : best_score; // 已经存在最佳候选时，将其距离保存为新的次近距离。
             best_score = score; // 保存新最佳候选的二维平方距离。
@@ -264,16 +264,19 @@ static int App_Task_MatchTarget(void) // 函数入口：在新图像中关联已
         return -1; // 返回当前目标不可使用或未能可靠匹配，由调用者按本步骤处理。
     } // 结束条件分支。
     if(best >= 0){ match_reason = "ok"; }
-    else if(match_reject[1] || match_reject[2] || match_reject[3] || match_reject[4] || match_reject[5]){ match_reason = "candidates_rejected"; }
+    else if(match_reject[1] || match_reject[2] || match_reject[3] || match_reject[4]){ match_reason = "candidates_rejected"; }
     else { match_reason = "no_same_type"; }
     return best; // 返回最近且无歧义的候选下标，未找到时保持-1。
 } // 结束App_Task_MatchTarget函数体。
 
 // @简介：视觉PID输出左右轮速；speed=0用于原地对准，正负值分别表示前进和倒车。
 // 平移时按速度绝对值限幅，保证两轮保持同一行驶方向；目标偏右时左轮加速、右轮减速。
-static void App_Task_VisualDrive(float x, float speed, uint8_t near) // 函数入口：视觉PID输出左右轮速；speed=0原地对准，正值前进、负值倒车。
+static void App_Task_VisualDriveAt(float x, float speed, uint8_t near, float aim_x, float x_tol)
 { // 开始App_Task_VisualDrive函数体。
-    float turn = near ? App_LinePID_ComputeNear(x) : App_LinePID_Compute(x); // 按是否处于近距离阶段选择近处或常规视觉PID，得到单侧差速量。
+    // x_tol<0保留绿色远/近死区；整区显式传入独立X允许误差。
+    float enter = x_tol >= 0.0f ? x_tol : (near ? LINE_PID_NEAR_ENTER : LINE_PID_DEAD_ENTER);
+    float exit = x_tol >= 0.0f ? x_tol : (near ? LINE_PID_NEAR_EXIT : LINE_PID_DEAD_EXIT);
+    float turn = App_LinePID_ComputeTarget(x, aim_x, enter, exit);
     float limit = App_Task_Abs(speed) * LINE_PID_FORWARD_RATIO; // 按基础速度绝对值计算差速限幅，避免纠偏使任一侧反向。
     if(speed != 0.0f){ // 前进和倒车均限制差速；speed为0时保留原地转向输出。
         if(turn > limit){ turn = limit; } // 限制正差速，避免转向修正抵消基础平移方向。
@@ -282,10 +285,15 @@ static void App_Task_VisualDrive(float x, float speed, uint8_t near) // 函数�
     App_Task_Move_Speed(speed + turn, speed - turn); // 仅运行速度内环
 } // 结束App_Task_VisualDrive函数体。
 
+static void App_Task_VisualDrive(float x, float speed, uint8_t near)
+{
+    App_Task_VisualDriveAt(x, speed, near, LINE_PID_AIM_X, -1.0f);
+}
+
 // @简介：按归一化中心坐标统计前框内实体；1=单绿色通过，0=未看到，-1=有冲突。
 // @说明：与App_Cargo_Test打印的x/y相同，230≤x≤490且400≤y≤450才计数；不检查框边缘。
 // 中心在区域外的实体不计数；区域内未知物、危险物、伤员等也计入，不能只数绿色。
-static int App_Task_CheckCargo(void) // 位置合格后继续检查单件、绿色类别和置信度。
+static int App_Task_CheckCargo(void) // 位置合格后继续检查单件和绿色类别。
 { // 开始App_Task_CheckCargo函数体。
     uint8_t i; // 声明遍历场景目标数组的下标。
     cargo_bad_index = -1; cargo_count = 0; cargo_reason = "cargo_empty";
@@ -302,70 +310,28 @@ static int App_Task_CheckCargo(void) // 位置合格后继续检查单件、绿�
            || y < APP_TASK_CARGO_Y_MIN || y > APP_TASK_CARGO_Y_MAX){ continue; } // 中心y在400～450之外时同样忽略。
         count++;
         cargo_count = count; // 中心位于前框区域内，计入本帧实体数量。
-        if(count > 1 || object->type != RESCUE_OBJECT_SUPPLY // 区域内多个实体或非绿色时拒绝复检。
-           || object->confidence < APP_TASK_CONFIDENCE_MIN){ // 绿色置信度仍须达到原门限。
+        if(count > 1 || object->type != RESCUE_OBJECT_SUPPLY){ // 区域内多个实体或非绿色时拒绝复检。
             cargo_bad_index = i;
-            cargo_reason = count > 1 ? "cargo_multiple"
-                           : (object->type != RESCUE_OBJECT_SUPPLY ? "cargo_wrong_type" : "cargo_low_confidence");
+            cargo_reason = count > 1 ? "cargo_multiple" : "cargo_wrong_type";
             return -1; // 返回当前目标不可使用或未能可靠匹配，由调用者按本步骤处理。
-        } // 结束中心入区后的数量、类型和置信度检查。
+        } // 结束中心入区后的数量和类型检查。
     } // 结束目标遍历循环。
     if(count == 1){ cargo_reason = "ok"; }
     return count == 1 ? 1 : 0; // 恰好一个合格绿色返回1，无实体中心在区域内则返回0。
 } // 结束App_Task_CheckCargo函数体。
 
-// @简介：寻找唯一可信本队物资分区；可来自相机或同帧整体安全区+分界线推导。
-// @返回：下标；-1未找到；-2多个同类分区/低置信度，不能确定目的地。
-static int App_Task_FindZone(void)
+
+// 远处只查本队整体安全区5/6，不要求分界线或分区标签。
+static int App_Task_FindWholeZone(void)
 {
-    int index = -1;
-    zone_bad_index = -1;
-    for(uint8_t i = 0; i < task_scene.object_count + derived_zone_count; ++i){
-        const RescueObject *object = App_Task_ObjectAt(i);
-        if(object->type != team_supply_type){ continue; }
-        if(index >= 0){ zone_reason = "zone_multiple"; zone_bad_index = i; return -2; }
-        if(object->confidence < APP_TASK_CONFIDENCE_MIN){
-            zone_reason = "zone_low_confidence"; zone_bad_index = i; return -2;
-        }
-        index = i;
+    for(uint8_t i = 0; i < task_scene.object_count; ++i){
+        if(task_scene.objects[i].type == team_zone_type){ return i; }
     }
-    zone_reason = index >= 0 ? "ok" : App_Task_Zone_LastReason(team_supply_type);
-    return index;
+    return -1;
 }
 
-// @简介：检查前往分区的图像通道；危险物、障碍、伤员、核心物资、未知物及对方区阻挡则停。
-// 普通绿色可能就是前框内物块；不据此推断实际载物数量，也不替代全局定位/避障。
-static uint8_t App_Task_ZonePathClear(void) // 函数入口：检查前往分区的图像通道；危险物、障碍、伤员、核心物资、未知物及对方区阻挡则停。
-{ // 开始App_Task_ZonePathClear函数体。
-    zone_path_index = -1; // 保存实际阻挡目的区通道的那一个框。
-    uint8_t i; // 声明遍历场景目标数组的下标。
-    uint8_t green_count = 0; // 从零累计前往物资区通道中的绿色实体数量。
-    uint8_t own_whole = team_supply_type == RESCUE_OBJECT_RED_SUPPLY_ZONE // 根据已锁存的物资分区类型判断本队颜色。
-                        ? RESCUE_OBJECT_RED_SAFE_ZONE : RESCUE_OBJECT_BLUE_SAFE_ZONE; // 选择本队对应的整体安全区标签，用于忽略目的地背景区域。
-    float x = App_Task_X(&target); // 取得锁定物资区中心的归一化x坐标。
-    float path_left = (x < APP_TASK_AIM_X ? x : APP_TASK_AIM_X) - APP_TASK_PATH_HALF_WIDTH; // 以车头和目标中较小的x向左扩展，形成接近通道左边界。
-    float path_right = (x > APP_TASK_AIM_X ? x : APP_TASK_AIM_X) + APP_TASK_PATH_HALF_WIDTH; // 以车头和目标中较大的x向右扩展，形成接近通道右边界。
-    for(i = 0; i < task_scene.object_count + derived_zone_count; i++){
-        const RescueObject *object = App_Task_ObjectAt(i); // 本地伤员区也参与阻挡检查，分界线不整体忽略。
-        float half_w = object->width * (APP_TASK_IMAGE_W * 0.5f) / task_scene.image_width; // 计算当前检测框在参考图像中的半宽。
-        if(object->type == team_supply_type || object->type == own_whole // 本队物资分区及本队整体安全区属于目的地背景标签。
-           || object->type == RESCUE_OBJECT_START_ZONE){ continue; } // 出发区同样不作为通道实体，跳过这些区域标签。
-        // 首次对准仅原地转向：本队右侧分区和紧贴物资区右沿的已关联分界线
-        // 不作为平移通道阻挡；进入前进阶段后仍检查，危险物等实体始终检查。
-        if(target_zone_derived && follow_forward == 0
-           && (object->type == team_supply_type + 1U
-               || (object->type == RESCUE_OBJECT_SAFE_ZONE_DIVIDER
-                   && object->cx - object->width / 2U == target.cx - target.width / 2U + target.width
-                   && object->cy >= target.cy - target.height / 2U
-                   && object->cy <= target.cy - target.height / 2U + target.height))){ continue; }
-        if(App_Task_X(object) + half_w < path_left || App_Task_X(object) - half_w > path_right // 检测框完全位于水平接近通道之外时不按当前阻挡处理。
-           || App_Task_Bottom(object) < App_Task_Y(&target)){ continue; } // 框底边未到目的区中心深度时也跳过。
-        if(object->type == RESCUE_OBJECT_SUPPLY && ++green_count == 1){ continue; } // 允许通道内第一件绿色，可能是前框内物块；不能据此确认真实载物数。
-        zone_path_index = i;
-        return 0; // 当前检查不通过，返回0拒绝继续该动作。
-    } // 结束目标遍历循环。
-    return 1; // 当前检查通过，返回1表示本次条件成立。
-} // 结束App_Task_ZonePathClear函数体。
+
+
 
 // @简介：失败/超时时打印最后检查现场；snapshot=0表示快照是旧值，不能当作当前图。
 void App_Task_Vision_LogDetails(const char *stage)
@@ -422,10 +388,10 @@ void App_Task_Vision_LogDetails(const char *stage)
                              (unsigned int)o->confidence, (unsigned int)o->cx, (unsigned int)o->cy);
         }
     }else {
-        App_USART1_Printf("[MATCH] reason=%s reject(type,conf,id,w,h,dist)=(%u,%u,%u,%u,%u,%u)\r\n",
+        App_USART1_Printf("[MATCH] reason=%s reject(type,id,w,h,dist)=(%u,%u,%u,%u,%u)\r\n",
                          match_reason, (unsigned int)match_reject[0], (unsigned int)match_reject[1],
                          (unsigned int)match_reject[2], (unsigned int)match_reject[3],
-                         (unsigned int)match_reject[4], (unsigned int)match_reject[5]);
+                          (unsigned int)match_reject[4]);
         App_USART1_Printf("[MATCH] best2=%.1f second2=%.1f gate=%.1f ambiguity2=%.1f\r\n",
                          match_best_score, match_second_score, APP_TASK_TRACK_GATE,
                          APP_TASK_TRACK_AMBIGUITY * APP_TASK_TRACK_AMBIGUITY);
@@ -434,17 +400,7 @@ void App_Task_Vision_LogDetails(const char *stage)
                          (unsigned int)diagnostic_target.track_id, (unsigned int)diagnostic_target.cx,
                          (unsigned int)diagnostic_target.cy, (unsigned int)diagnostic_target.width,
                          (unsigned int)diagnostic_target.height);
-        if(strcmp(stage, "ZONE") == 0){
-            int index = zone_path_index >= 0 ? zone_path_index : zone_bad_index;
-            App_USART1_Printf("[ZONE] detail=%s path_idx=%d candidate_idx=%d\r\n",
-                             zone_reason, zone_path_index, zone_bad_index);
-            if(diagnostic_zone_valid || (index >= 0 && index < task_scene.object_count + derived_zone_count)){
-                const RescueObject *o = diagnostic_zone_valid ? &diagnostic_zone_object : App_Task_ObjectAt((uint8_t)index);
-                App_USART1_Printf("[ZONE] other type=%u conf=%u xy=(%u,%u) wh=(%u,%u)\r\n",
-                                 (unsigned int)o->type, (unsigned int)o->confidence, (unsigned int)o->cx,
-                                 (unsigned int)o->cy, (unsigned int)o->width, (unsigned int)o->height);
-            }
-        }
+
     }
 }
 
@@ -455,36 +411,124 @@ static App_Task_Result App_Task_Vision_Failed(void) // 函数入口：视觉步�
     return APP_STEP_FAILED; // 报告本步骤失败，不再批准后续动作。
 } // 结束App_Task_Vision_Failed函数体。
 
-// 安全区失配立即撤销前进并旋转重搜；相机俯角不变，保留当前view_id和已处理帧记录。
+
+static App_Task_Result App_Task_CaptureFollow(float x, float y, float aim_x, float x_tol,
+                                               float stop_y, float y_tol, float *drive_speed);
+
+// 沿用安全区读图：当前view_id、有效图及新帧；GetScene另有500ms本地年龄限制。
+// 不新增绿色的ID/尺寸/位移/置信度/列表截断筛选。
+static int App_Task_ReadZoneScene(void)
+{
+    App_Task_UpdateView();
+    if(Rescue_Usart2_GetScene(&task_scene) == 0
+       || task_scene.view_id != view_id
+       || (task_scene.flags & RESCUE_SCENE_IMAGE_VALID) == 0){ return -1; }
+    return App_Task_NewFrame() ? 1 : 0;
+}
+
+static uint8_t App_Task_ZoneInRange(const RescueObject *object)
+{
+    return App_Task_Abs(App_Task_X(object) - APP_TASK_ZONE_AIM_X) <= APP_TASK_ZONE_X_TOL
+           && App_Task_Abs(App_Task_Y(object) - APP_TASK_ZONE_AIM_Y) <= APP_TASK_ZONE_Y_TOL;
+}
+
 static App_Task_Result App_Task_ZoneResearch(const char *reason)
 {
     App_Task_Move_Stop();
-    diagnostic_target = target; // 清理控制目标前保留失败现场。
-    int index = zone_path_index >= 0 ? zone_path_index : zone_bad_index;
-    diagnostic_zone_valid = index >= 0 && index < task_scene.object_count + derived_zone_count;
-    if(diagnostic_zone_valid){ diagnostic_zone_object = *App_Task_ObjectAt((uint8_t)index); }
-    target = (RescueObject){0};
-    target_zone = 0;
-    target_zone_derived = 0;
-    follow_forward = 0;
-    lost_frames = 0;
-    arrive_frames = 0;
-    derived_zone_count = 0;
+    zone_confirming = zone_missing = zone_stopped = 0;
+    zone_drive_speed = 0.0f;
     App_LinePID_Reset();
-    App_Task_Move_Speed(APP_TASK_ZONE_SPIN_SPEED, -APP_TASK_ZONE_SPIN_SPEED);
     if(APP_TASK_DEBUG_ENABLE){ App_USART1_Printf("[ZONE] research=%s\r\n", reason); }
-    App_Task_Vision_LogDetails("ZONE"); // 保持原先立即旋转的顺序，再打印已冻结的失败现场。
-    return APP_STEP_RESEARCH;
+    return APP_STEP_RESEARCH; // 任务层发新view_id并立即开始旋转；不抬框、不清载物锁。
 }
+
+static App_Task_Result App_Task_ZoneFollow(void)
+{
+    uint32_t now = HAL_GetTick();
+    // 确认总期限不因重复/无效图延长；到期不接受迟到的第三张。
+    if(zone_confirming && (uint32_t)(now - zone_confirm_time) >= APP_TASK_ZONE_CONFIRM_MS){
+        return App_Task_ZoneResearch("confirm_timeout");
+    }
+    int frame = App_Task_ReadZoneScene();
+    int index = frame > 0 ? App_Task_FindWholeZone() : -1;
+    if(zone_confirming){
+        App_Task_Move_Stop();
+        if(frame > 0){
+            ++zone_confirm_frames; // 有效空图/无本队整区/XY超差均占一张失败图。
+            if(index >= 0 && App_Task_ZoneInRange(&task_scene.objects[index])){ ++zone_confirm_hits; }
+            if(APP_TASK_DEBUG_ENABLE){
+                App_USART1_Printf("[ZONE] confirm=%u/%u hits=%u\r\n",
+                                 (unsigned int)zone_confirm_frames, (unsigned int)APP_TASK_ZONE_CONFIRM_FRAMES,
+                                 (unsigned int)zone_confirm_hits);
+            }
+            if(zone_confirm_frames >= APP_TASK_ZONE_CONFIRM_FRAMES){
+                if(zone_confirm_hits >= APP_TASK_ZONE_CONFIRM_HITS){
+                    zone_confirming = 0;
+                    if(APP_TASK_DEBUG_ENABLE){ App_USART1_Printf("[ZONE] done cargo=held\r\n"); }
+                    return APP_STEP_DONE;
+                }
+                return App_Task_ZoneResearch("confirm_no_hit");
+            }
+        }
+        return APP_STEP_WAIT;
+    }
+
+    if(index >= 0){
+        target = task_scene.objects[index]; // 只取第一个本队整区，不关联旧框ID/尺寸/位移。
+        if(zone_missing){
+            App_LinePID_Reset();
+            if(APP_TASK_DEBUG_ENABLE){ App_USART1_Printf("[ZONE] found phase=%s\r\n", follow_forward ? "xy" : "align"); }
+        }
+        zone_missing = zone_stopped = 0;
+        App_Task_Result result = App_Task_CaptureFollow(App_Task_X(&target), App_Task_Y(&target),
+            APP_TASK_ZONE_AIM_X, APP_TASK_ZONE_X_TOL, APP_TASK_ZONE_AIM_Y, APP_TASK_ZONE_Y_TOL,
+            &zone_drive_speed);
+        if(result == APP_STEP_DONE){
+            zone_confirming = 1;
+            zone_confirm_frames = zone_confirm_hits = 0;
+            zone_confirm_time = HAL_GetTick(); // 触发停车的本张已被读图去重，不计入后续三图。
+            if(APP_TASK_DEBUG_ENABLE){ App_USART1_Printf("[ZONE] phase=confirm\r\n"); }
+        }
+        return APP_STEP_RUNNING;
+    }
+
+    if(frame != 0 && !zone_missing){ // 正常两张新图之间只维持速度环，不误判丢失。
+        zone_missing = 1;
+        zone_stopped = 0;
+        zone_missing_time = now;
+        if(follow_forward){
+            App_Update_Data();
+            Set_Angle_Target(angle_yaw);
+        }else { App_Task_Move_Stop(); }
+        if(APP_TASK_DEBUG_ENABLE){
+            App_USART1_Printf("[ZONE] missing phase=%s next=%s\r\n",
+                             follow_forward ? "xy" : "align", follow_forward ? "hold" : "wait");
+        }
+    }
+    if(!zone_missing){ App_Task_Move_Proc(); return APP_STEP_RUNNING; }
+
+    uint32_t elapsed = (uint32_t)(now - zone_missing_time);
+    if(!follow_forward){
+        if(elapsed >= APP_TASK_ZONE_ALIGN_LOST_MS){ return App_Task_ZoneResearch("align_lost"); }
+        App_Task_Move_Stop();
+    }else if(elapsed < APP_TASK_ZONE_HOLD_MS){
+        App_Heading_Pro(zone_drive_speed); // 保留实际前进/倒车/零速度，不使用旧视觉差速。
+    }else if(elapsed < APP_TASK_ZONE_HOLD_MS + APP_TASK_ZONE_STOP_WAIT_MS){
+        App_Task_Move_Stop();
+        if(!zone_stopped && APP_TASK_DEBUG_ENABLE){ App_USART1_Printf("[ZONE] missing phase=xy next=wait\r\n"); }
+        zone_stopped = 1;
+    }else { return App_Task_ZoneResearch("xy_lost"); }
+    return APP_STEP_WAIT;
+}
+
 
 // @简介：跟随失败时先停车，再打印一次原因和最后保存的图像/目标信息。
 // @说明：phase为0表示首次对准、1表示前进；读取场景失败时，字段仍是最后保存值。
 static App_Task_Result App_Task_FollowFailed(const char *reason) // reason为本次退出原因，不周期打印。
 { // 开始失败诊断函数。
-    if(target_zone){ return App_Task_ZoneResearch(reason); } // 安全区重新搜索，不结束整段救援任务。
     App_Task_Result result = App_Task_Vision_Failed(); // 先撤销运动，避免串口发送延后停车。
     if(APP_TASK_DEBUG_ENABLE){ // 与任务、转向日志使用同一个调试开关。
-        App_USART1_Printf("[FOLLOW] stop=%s phase=%u dt=%lu\r\n", reason, (unsigned int)follow_forward, (unsigned long)(HAL_GetTick() - follow_time)); // 输出退出原因、阶段与阶段已运行毫秒数。
+        App_USART1_Printf("[FOLLOW] stop=%s phase=%u\r\n", reason, (unsigned int)follow_forward); // 输出退出原因和当前阶段。
         App_USART1_Printf("[VISION] frame=%u age=%lu view=%u/%u flags=%u n=%u\r\n", (unsigned int)task_scene.frame_id, (unsigned long)(HAL_GetTick() - task_scene.received_ms), (unsigned int)task_scene.view_id, (unsigned int)view_id, (unsigned int)task_scene.flags, (unsigned int)task_scene.object_count); // 输出最后保存图像的本地年龄、收到/期望视角和标志。
         App_USART1_Printf("[TARGET] xy=(%u,%u) wh=(%u,%u) img=(%u,%u) lost=%u mixed=%u\r\n", (unsigned int)target.cx, (unsigned int)target.cy, (unsigned int)target.width, (unsigned int)target.height, (unsigned int)target_image_w, (unsigned int)target_image_h, (unsigned int)lost_frames, (unsigned int)target_mixed); // 输出锁定目标原始像素框、锁定时分辨率、丢失帧数及撞散用途。
     } // 结束调试开关判断。
@@ -492,11 +536,38 @@ static App_Task_Result App_Task_FollowFailed(const char *reason) // reason为本
     return result; // 保持原来的失败返回值，上层随后回到停车状态。
 } // 结束失败诊断函数。
 
-// @简介：未匹配原目标时先停车；连续有效新帧均找不到才结束，旧锁定框保持不变。
+// 普通绿色的坏图和失配共用停等期限，只有有效新图失配累计帧数。
+static App_Task_Result App_Task_GreenMissing(uint8_t missing_frame, const char *reason)
+{
+    App_Task_Move_Stop();
+    capture_y_direction = 0;
+    capture_y_request = 0;
+    capture_y_frames = 0;
+    arrive_frames = 0;
+    if(green_waiting == 0){
+        green_waiting = 1;
+        lost_time = HAL_GetTick();
+        App_LinePID_Reset();
+        if(APP_TASK_DEBUG_ENABLE){ App_USART1_Printf("[FOLLOW] wait=%s phase=%u\r\n", reason, (unsigned int)follow_forward); }
+        App_Task_Vision_LogDetails("FOLLOW");
+    }
+    if(missing_frame){ ++lost_frames; }
+    if(lost_frames >= APP_TASK_LOST_FRAMES
+       || (uint32_t)(HAL_GetTick() - lost_time) >= APP_TASK_LOST_TIMEOUT_MS){
+        if(APP_TASK_DEBUG_ENABLE){
+            App_USART1_Printf("[FOLLOW] lost=%s next=back_search\r\n",
+                             lost_frames >= APP_TASK_LOST_FRAMES ? "target_lost" : "lost_timeout");
+        }
+        return APP_STEP_TARGET_LOST;
+    }
+    return APP_STEP_WAIT;
+}
+
+// @简介：未匹配原目标时先停车；普通绿色确认丢失后交任务层后退，旧用途保持原处理。
 // @说明：同帧/坏图不在此累计；恢复匹配仍需原ID（如有）、位置/尺寸门限，不能改选其它绿色。
 static App_Task_Result App_Task_TargetMissing(void) // 函数入口：未匹配原目标时先停车；连续有效新帧均找不到才结束，旧锁定框保持不变。
 { // 开始App_Task_TargetMissing函数体。
-    if(target_zone){ return App_Task_ZoneResearch("target_missing"); } // 安全区不等待3帧或600ms。
+    if(target_mixed == 0){ return App_Task_GreenMissing(1, match_reason); }
     App_Task_Move_Stop(); // 撤销位置/角度控制并将左右轮目标速度置零。
     capture_y_direction = 0; // 丢失时清除纵向实际运动方向，恢复后必须重新稳定确认。
     capture_y_request = 0; // 清除丢失前等待恢复的方向请求。
@@ -505,7 +576,7 @@ static App_Task_Result App_Task_TargetMissing(void) // 函数入口：未匹配�
     if(lost_frames == 0){ // 第一次未匹配原目标时，记录本次短暂丢失的起点。
         lost_time = HAL_GetTick(); // 先记录原计时起点，再打印；日志不延后丢失超时起点。
         if(APP_TASK_DEBUG_ENABLE){ App_USART1_Printf("[MATCH] wait=%s lost=1/%u\r\n", match_reason, (unsigned int)APP_TASK_LOST_FRAMES); }
-        App_Task_Vision_LogDetails(target_zone ? "ZONE" : "FOLLOW"); // 已停车，只在首次丢失时打印关联失败现场。
+        App_Task_Vision_LogDetails("FOLLOW"); // 已停车，只在首次丢失时打印关联失败现场。
         App_LinePID_Reset(); // 清空视觉PID历史误差及死区状态，避免旧输出干扰新阶段。
     } // 结束条件分支。
     if(++lost_frames >= APP_TASK_LOST_FRAMES){ return App_Task_FollowFailed("target_lost"); } // 连续有效新帧均找不到原目标达到门限后确认丢失并失败。
@@ -534,25 +605,42 @@ static App_Task_Result App_Task_Arrive(float x, float y) // 函数入口：到�
            ? APP_STEP_DONE : APP_STEP_WAIT; // 帧数和时间都满足才返回完成，否则保持停车等待。
 } // 结束App_Task_Arrive函数体。
 
-// @简介：单独绿色的纵向P控制；方向切换先停车，越过外门限且稳定后再恢复。
+// @简介：绿色和整区共用首次X对准与纵向P控制；目标及允许误差由调用方传入。
 // @说明：Y误差为目标Y减当前Y，正值前进、负值倒车；停车带内只做横向补正和到位复核。
-static App_Task_Result App_Task_CaptureFollow(float x, float y) // x、y为640x480参考坐标系中的目标中心。
-{ // 开始单独绿色纵向跟随函数体。
-    float error = LINE_PID_STOP_Y - y; // 目标比停车位置远时为正，要求前进；过近时为负，要求倒车。
+static App_Task_Result App_Task_CaptureFollow(float x, float y, float aim_x, float x_tol,
+                                               float stop_y, float y_tol, float *drive_speed) // 输出实际纵向速度供暂失时保持。
+{ // 绿色与整区共用同一份视觉PID和Y轴比例调速，不设专用接近速度。
+    float deadband = target_zone ? x_tol : -1.0f; // 绿色保留原远/近横向死区。
+    *drive_speed = 0.0f; // 对准、停车及等待分支均没有纵向运动。
+    if(follow_forward == 0){ // 首次原地对准只用X误差转向，Y轴运动控制从对准完成后开始。
+        if(target_zone ? App_Task_Abs(x - aim_x) <= x_tol : App_LinePID_InDeadband(x)){ // 目标x进入横向死区时结束首次对准。
+            App_Task_Move_Stop(); // 对准阶段结束时停车，避免把转向输出带入平移。
+            App_LinePID_Reset(); // 清除横向PID历史误差及死区状态。
+            follow_forward = 1; // 标记首次对准已完成，进入XY纵向跟随阶段。
+            capture_y_direction = 0; // 从停车状态开始判定纵向控制方向。
+            capture_y_request = 0; // 清除之前可能遗留的待恢复方向。
+            capture_y_frames = 0; // 重置纵向方向稳定确认帧数。
+            capture_y_wait_time = HAL_GetTick(); // 记录首次平移前的停车等待起点。
+            return APP_STEP_RUNNING; // 下一张新图再开始Y轴方向确认和运动。
+        } // 结束首次对准完成判断。
+        App_Task_VisualDriveAt(x, 0.0f, 0, aim_x, deadband); // 目标尚未对准时仅原地执行X轴视觉PID。
+        return APP_STEP_RUNNING; // 对准阶段不执行前后运动。
+    } // 结束首次原地对准处理。
+    float error = stop_y - y; // 由本用途的独立Y目标计算，其余P参数不变。
     float abs_error = App_Task_Abs(error); // 取得纵向像素误差绝对值，用于停车带和速度计算。
     int8_t request = error >= 0.0f ? 1 : -1; // 将误差方向转换为前进1或倒车-1。
     float speed; // 保存Y轴比例控制算出的轮速幅值，单位cm/s。
     uint32_t now = HAL_GetTick(); // 读取当前时间，供方向稳定等待使用。
 
-    if(abs_error <= LINE_PID_STOP_Y_BAND){ // 目标中心进入400±10像素的真实停车带。
+    if(abs_error <= y_tol){ // 绿色和整区均使用各自的Y停车带。
         capture_y_direction = 0; // 停止纵向控制，不让微小误差引起前后摆动。
         capture_y_request = 0; // 清除待恢复方向，滞回停车本身不代表到位完成。
         capture_y_frames = 0; // 清空方向确认帧数。
         App_Task_Move_Stop(); // 停车后再判断是否满足落框所需的位置条件。
-        if(App_Task_Abs(x - APP_TASK_AIM_X) <= APP_TASK_ARRIVE_X){ // 纵向和横向都在允许范围才进入落框稳定复核。
-            return App_Task_Arrive(x, y); // 按连续稳定新帧及最短停车时间确认到位。
+        if(App_Task_Abs(x - aim_x) <= x_tol){ // 纵向和横向都在允许范围才进入落框稳定复核。
+            return target_zone ? APP_STEP_DONE : App_Task_Arrive(x, y); // 整区交给三图确认；绿色保留原稳定复核。
         } // 结束到位位置判断。
-        App_Task_VisualDrive(x, 0.0f, 0); // Y已到位但X偏差较大时，只原地用横向PID转正。
+        App_Task_VisualDriveAt(x, 0.0f, 0, aim_x, deadband); // Y已到位但X偏差较大时，只原地用横向PID转正。
         return APP_STEP_RUNNING; // 等待下一张新图重新判断XY位置。
     } // 结束停车带处理。
 
@@ -567,12 +655,12 @@ static App_Task_Result App_Task_CaptureFollow(float x, float y) // x、y为640x4
             return APP_STEP_WAIT; // 本帧只停车，不下发反向速度。
         } // 结束方向反转判断。
     }else { // 当前已停车，检查是否达到滞回外门限并满足稳定重启条件。
-        if(abs_error < LINE_PID_STOP_Y_BAND + LINE_PID_Y_HYSTERESIS){ // 外门限默认20px；门限内保持停车且不置到位标志。
+        if(abs_error < y_tol + LINE_PID_Y_HYSTERESIS){ // 以本用途的停车带加公共滞回作为外门限。
             capture_y_request = 0; // 清除尚未越过外门限的方向请求。
             capture_y_frames = 0; // 清空不满足恢复条件时的连续新帧计数。
             App_Task_Move_Stop(); // 保持停车，不把滞回区误当作到位区。
-            if(App_Task_Abs(x - APP_TASK_AIM_X) > APP_TASK_ARRIVE_X){ // X仍偏离前框范围时允许原地修正朝向。
-                App_Task_VisualDrive(x, 0.0f, 0); // 只调整横向，不执行纵向平移。
+            if(App_Task_Abs(x - aim_x) > x_tol){ // X仍偏离前框范围时允许原地修正朝向。
+                App_Task_VisualDriveAt(x, 0.0f, 0, aim_x, deadband); // 只调整横向，不执行纵向平移。
             } // 结束横向修正判断。
             return APP_STEP_WAIT; // 等待误差明确越过外门限，或下一帧进入真实停车带。
         } // 结束外门限判断。
@@ -584,7 +672,7 @@ static App_Task_Result App_Task_CaptureFollow(float x, float y) // x、y为640x4
             capture_y_frames++; // 增加连续同方向帧数，重复帧已在调用处过滤。
         } // 结束请求方向帧数更新。
         if(capture_y_frames < LINE_PID_Y_RESUME_FRAMES // 连续同方向新图不足时继续保持停车。
-           || (uint32_t)(now - capture_y_wait_time) < LINE_PID_Y_RESUME_WAIT_MS){ // 或停车等待时间尚未达到250ms时保持停车。
+           || (uint32_t)(now - capture_y_wait_time) < LINE_PID_Y_RESUME_WAIT_MS){ // 或停车等待时间尚未达到200ms时保持停车。
             App_Task_Move_Stop(); // 在确认窗口内保持小车停车。
             return APP_STEP_WAIT; // 等待后续新帧或时间满足恢复条件。
         } // 结束运动恢复条件判断。
@@ -595,26 +683,32 @@ static App_Task_Result App_Task_CaptureFollow(float x, float y) // x、y为640x4
     if(speed < LINE_PID_Y_MIN_SPEED){ speed = LINE_PID_Y_MIN_SPEED; } // 误差仍在运动区时施加最小轮速，克服电机静摩擦。
     if(request > 0 && speed > LINE_PID_Y_MAX_FORWARD){ speed = LINE_PID_Y_MAX_FORWARD; } // 限制向前接近的最大速度。
     if(request < 0 && speed > LINE_PID_Y_MAX_REVERSE){ speed = LINE_PID_Y_MAX_REVERSE; } // 倒车方向速度上限更低，减少过近修正冲击。
-    App_Task_VisualDrive(x, request > 0 ? speed : -speed, 1); // 按Y轴P速度前进/倒车，同时用横向视觉PID差速对准。
+    *drive_speed = request > 0 ? speed : -speed; // 保存这次真正使用的纵向速度，不另设固定速度。
+    App_Task_VisualDriveAt(x, *drive_speed, 1, aim_x, deadband); // 按Y轴P速度前进/倒车，同时用横向视觉PID差速对准。
     return APP_STEP_RUNNING; // 纵向调整仍在进行，主循环继续处理新图和速度闭环。
 } // 结束单独绿色纵向跟随函数体。
 
 // @简介：初始化队伍及跟踪用途；view_id不清零，重试不能复用之前的视角编号。
 void App_Task_Vision_Init(uint8_t team) // 函数入口：初始化队伍及跟踪用途；view_id不清零，重试不能复用之前的视角编号。
 { // 开始App_Task_Vision_Init函数体。
-    team_supply_type = team == APP_TASK_TEAM_RED ? RESCUE_OBJECT_RED_SUPPLY_ZONE : RESCUE_OBJECT_BLUE_SUPPLY_ZONE; // 按启动队伍锁存红方或蓝方物资放置区的协议类型。
+    team_zone_type = team == APP_TASK_TEAM_RED ? RESCUE_OBJECT_RED_SAFE_ZONE : RESCUE_OBJECT_BLUE_SAFE_ZONE; // 按启动队伍锁存红方或蓝方整块安全区类型。
     camera_angle = SERVO2_LIFT; // 本阶段期望俯角初始化为正常观察角。
     target_mixed = 0; // 清除撞散用途标志，后续由目标选择重新确定。
-    target_zone = 0; // 清除目的分区标志，初始化为场地物块用途。
-    target_zone_derived = 0;
-    derived_zone_count = 0;
+    target_zone = 0; // 清除整区用途标志，初始化为场地物块用途。
     App_LinePID_Reset(); // 清空视觉PID历史误差及死区状态，避免旧输出干扰新阶段。
+    green_waiting = 0;
 } // 结束App_Task_Vision_Init函数体。
 
 // @简介：开始新视角，清除上一阶段的新帧和复检计数；等待由调用方指定，0表示立即发送新编号。
 void App_Task_Vision_Begin(float angle, uint32_t settle_ms) // 函数入口：开始新视角并指定稳定等待，0表示立即发送新编号。
 { // 开始App_Task_Vision_Begin函数体。
     App_Task_Move_Stop(); // 撤销位置/角度控制并将左右轮目标速度置零。
+    App_Task_Vision_BeginMoving(angle, settle_ms); // 复用原新视角初始化；其它阶段仍先停车。
+} // 结束App_Task_Vision_Begin函数体。
+
+// @简介：保持当前轮速开始新视角；启动切换、复检及恢复重搜共用，不产生切换短停。
+void App_Task_Vision_BeginMoving(float angle, uint32_t settle_ms)
+{
     camera_angle = angle; // 保存本阶段期望俯角，后续对照舵机结构体设定角检查。
     view_begin_time = HAL_GetTick(); // 记录新视角开始时刻，从此计算画面稳定等待。
     view_settle_ms = settle_ms; // 保存本次等待时长，不改变右转、换向或撞散重选的等待参数。
@@ -622,51 +716,50 @@ void App_Task_Vision_Begin(float angle, uint32_t settle_ms) // 函数入口：�
     if(view_id == 0){ view_id = 1; } // 编号回绕到0时跳过零值，继续使用非零上下文编号。
     view_sent = 0; // 标记新视角上下文尚未成功发送。
     view_send_failed = 0; scene_snapshot = 0;
-    scene_reason = match_reason = cargo_reason = zone_reason = scatter_reason = "not_checked";
+    scene_reason = match_reason = cargo_reason = scatter_reason = "not_checked";
     verify_wait = select_wait = "new_view";
-    verify_reported = select_reported = zone_reported = 0;
+    verify_reported = select_reported = 0;
     verify_new_total = verify_duplicates = verify_invalid = 0;
-    cargo_bad_index = zone_bad_index = zone_path_index = scatter_bad_index = -1;
-    cargo_count = 0; checked_age = 0; diagnostic_zone_valid = 0;
+    cargo_bad_index = scatter_bad_index = -1;
+    cargo_count = 0; checked_age = 0;
     diagnostic_target = target;
 
     frame_seen = 0; // 清除已见帧标志，重新建立本阶段帧去重基准。
     verify_frames = 0; // 清零本轮复检已检查的新图数量。
     verify_hits = 0; // 清零本轮复检合格新图数量，不能继承上一阶段的命中。
+    verify_failure = APP_VERIFY_NONE;
     search_empty_frames = 0; // 清零连续无候选计数，重新判断本视角是否无目标。
-    derived_zone_count = 0;
     lost_frames = 0; // 清零原目标连续未匹配的新帧计数。
+    green_waiting = 0;
     arrive_frames = 0; // 清零连续到位确认帧数，禁止继承旧确认结果。
     App_Task_UpdateView(); // 无稳定等待时本次调用立即发新编号；有等待的阶段仍到时后再发。
-} // 结束App_Task_Vision_Begin函数体。
+} // 结束App_Task_Vision_BeginMoving函数体。
 
-// @简介：初步调试只选择可信绿色，不判断其它检测框是否与其相邻。
+// @简介：初步调试只按类型选择绿色，不判断其它检测框是否与其相邻。
 // @说明：沿用框底边更低优先、同底边时更靠近瞄准中心x的排序；锁定后不重新排名。
 //        暂不根据相邻关系选择物资堆或自动进入撞散分支。
 int App_Task_Vision_Select(void) // 函数入口：从完整有效的新图中选择绿色物资，不检查邻居。
 { // 开始App_Task_Vision_Select函数体。
     int best = -1; // 最佳绿色候选下标初始化为未找到。
-    uint8_t low_green = 0; // 只记录绿色自身低置信的数量。
     uint8_t i; // 声明遍历场景目标数组的下标。
     if(App_Task_ReadScene() == 0){ search_empty_frames = 0; select_wait = scene_reason; App_Task_LogWait("SELECT", select_wait, &select_reported); return -1; } // 坏图不作为空图累计，清除判空计数后继续等待。
     if(App_Task_NewFrame() == 0){ select_wait = "duplicate_frame"; return -1; } // 不刷屏，超时时仍能区分重复帧等待。
     for(i = 0; i < task_scene.object_count; i++){ // 逐项检查相机上报的目标，只按本框信息筛选绿色。
         const RescueObject *object = &task_scene.objects[i]; // 取得当前候选的只读指针。
         float error = App_Task_Abs(App_Task_X(object) - APP_TASK_AIM_X); // 计算候选偏离车头中心x的误差，用于排序。
-        if(object->type != RESCUE_OBJECT_SUPPLY // 绿色仍是当前可落框目标，其它类别不作为候选。
-           || object->confidence < APP_TASK_CONFIDENCE_MIN){ if(object->type == RESCUE_OBJECT_SUPPLY){ ++low_green; } continue; } // 仅记录原有筛选原因。
+        if(object->type != RESCUE_OBJECT_SUPPLY){ continue; } // 绿色仍是当前可落框目标，其它类别不作为候选。
         if(best < 0){ best = i; continue; } // 首个合格绿色直接保存。
         if(App_Task_Bottom(object) > App_Task_Bottom(&task_scene.objects[best]) // 框底边更靠下的绿色优先。
            || (App_Task_Bottom(object) == App_Task_Bottom(&task_scene.objects[best]) // 底边相同时比较横向偏差。
                && error < App_Task_Abs(App_Task_X(&task_scene.objects[best]) - APP_TASK_AIM_X))){ best = i; } // 优先选择更靠近瞄准中心x的绿色。
     } // 结束绿色候选遍历循环。
-    if(best >= 0){ // 找到可信绿色后锁定，沿用原单件对准、接近和落框流程。
+    if(best >= 0){ // 找到绿色后锁定，沿用原单件对准、接近和落框流程。
         search_empty_frames = 0; // 清除连续无候选计数。
         select_wait = "ok"; select_reported = 0;
         App_Task_Lock((uint8_t)best, 0, 0); // 锁定绿色物资；不按相邻关系标记为撞散用途。
         return 1; // 返回已锁定目标，由上层停车并切换到跟随。
     } // 结束找到绿色分支。
-    select_wait = low_green ? "green_low_confidence" : "no_green";
+    select_wait = "no_green";
     App_Task_LogWait("SELECT", select_wait, &select_reported);
     return ++search_empty_frames >= APP_TASK_SEARCH_EMPTY_FRAMES ? 0 : -1; // 保留原无候选返回约定，启动旋转搜索收到0仍继续转。
 } // 结束App_Task_Vision_Select函数体。
@@ -677,75 +770,62 @@ uint8_t App_Task_Vision_IsMixed(void) // 函数入口：报告已锁定目标用
     return target_mixed; // 返回锁定时确定的撞散用途标志，不随列表顺序改变。
 } // 结束App_Task_Vision_IsMixed函数体。
 
-// @简介：物块/本队物资区共用的非阻塞接近函数，封装首次对准、目标关联及视觉PID。
+// @简介：物块/本队整区共用的非阻塞接近函数，封装首次对准、目标关联及视觉PID。
 // @返回：DONE=到位停车复核通过；FAILED=连续丢失/超时/阻挡；其它结果继续调用。
 // @说明：首次原地对准后只向前差速，不再原地纠偏；帧间只跑速度闭环。
-App_Task_Result App_Task_Vision_Follow(void) // 函数入口：物块/本队物资区共用的非阻塞接近函数，封装首次对准、目标关联及视觉PID。
+App_Task_Result App_Task_Vision_Follow(void) // 函数入口：物块/本队整区共用的非阻塞接近函数，封装首次对准、目标关联及视觉PID。
 { // 开始App_Task_Vision_Follow函数体。
-    diagnostic_target = target; // 保存判断前原目标，供失败及安全区重搜打印。
-    diagnostic_zone_valid = 0; zone_bad_index = zone_path_index = -1;
-    zone_reason = scatter_reason = "not_checked"; // 本次未执行的子检查不沿用上次的ok或失败原因。
+    diagnostic_target = target; // 保存判断前原目标，供物块跟随失败打印。
+    scatter_reason = "not_checked"; // 本次未执行的子检查不沿用上次的ok或失败原因。
     match_reason = "not_checked"; memset(match_reject, 0, sizeof(match_reject));
     match_best_score = match_second_score = 0.0f;
+    if(target_zone){ return App_Task_ZoneFollow(); }
     int index; // 保存本帧与原锁定目标关联成功的下标。
     uint8_t near; // 记录目标是否进入停车门限附近的减速范围。
-    uint8_t capture = target_zone == 0 && target_mixed == 0; // 仅单独绿色落框使用已确认的Y目标±10，物资堆及分区保持原门限。
+    uint8_t capture = target_zone == 0 && target_mixed == 0; // 仅单独绿色落框使用已确认的Y目标±10，旧物资堆保持原门限。
     float y; // 保存目标中心的归一化y坐标，向下增大。
     float speed; // 保存本次视觉驱动的基础线速度，单位cm/s。
-    float stop_y = target_zone ? APP_TASK_ZONE_STOP_Y // 锁定为目的分区时使用物资区中心y停车门限。
-                              : (target_mixed ? LINE_PID_SCATTER_STOP_Y : LINE_PID_STOP_Y); // 场地物块根据撞散或单绿色用途选择对应停车门限。
-    if(capture){ stop_y -= LINE_PID_STOP_Y_BAND; } // 单独绿色进入390～410即开始停车复核，下界390用于停止继续前进。
-    uint32_t timeout = follow_forward ? APP_TASK_APPROACH_TIMEOUT_MS : APP_TASK_ALIGN_TIMEOUT_MS; // 按当前对准或持续前进阶段，选择对应超时上限。
-    if((uint32_t)(HAL_GetTick() - follow_time) >= timeout){ // 保持原阶段超时优先级，区分首次对准和前进超时。
-        return App_Task_FollowFailed(follow_forward ? "approach_timeout" : "align_timeout"); // 停车并输出当前阶段超时原因。
-    } // 结束阶段超时判断。
-    if(App_Task_ReadScene() == 0){ return App_Task_FollowFailed("scene_invalid"); } // 图像不可用时停车，最后保存的图像字段仅供排查。
-    if(lost_frames != 0 && (uint32_t)(HAL_GetTick() - lost_time) >= APP_TASK_LOST_TIMEOUT_MS){ // 保持原来的目标丢失等待上限。
+    float stop_y = target_mixed ? LINE_PID_SCATTER_STOP_Y : LINE_PID_STOP_Y;
+    if(capture){ stop_y -= LINE_PID_STOP_Y_BAND; } // 旧路径的门限计算；单独绿色在下方直接使用公共XY控制及自己的Y目标。
+    if(capture && green_waiting && (uint32_t)(HAL_GetTick() - lost_time) >= APP_TASK_LOST_TIMEOUT_MS){
+        return App_Task_GreenMissing(0, "lost_timeout"); // 到期先后退重搜，不接受本次迟到的目标。
+    }
+    if(App_Task_ReadScene() == 0){
+        return capture ? App_Task_GreenMissing(0, scene_reason) : App_Task_FollowFailed("scene_invalid");
+    }
+    if(!capture && lost_frames != 0 && (uint32_t)(HAL_GetTick() - lost_time) >= APP_TASK_LOST_TIMEOUT_MS){ // 旧mixed用途保持原等待上限。
         return App_Task_FollowFailed("lost_timeout"); // 输出等待原目标恢复超时。
     } // 结束丢失等待超时判断。
-    if(task_scene.image_width != target_image_w || task_scene.image_height != target_image_h){ // 保持原来的图像分辨率一致性检查。
+    if(!capture && (task_scene.image_width != target_image_w || task_scene.image_height != target_image_h)){
         return App_Task_FollowFailed("image_size_changed"); // 输出锁定后分辨率发生变化。
     } // 结束分辨率判断。
     if(App_Task_NewFrame() == 0){ App_Task_Move_Proc(); return APP_STEP_RUNNING; } // 没有新图时仅继续速度内环，不重复计算视觉误差或到位帧数。
     index = App_Task_MatchTarget(); // 通过类型、ID、二维位移及框尺寸判断本帧哪个候选是原目标。
     if(index < 0){ return App_Task_TargetMissing(); } // 未可靠匹配原目标时先停车，再累计连续丢失新帧。
-    if(target_zone){ // 目的分区跟随还必须确认本队物资分区唯一可信。
-        if(App_Task_FindZone() != index){ return App_Task_FollowFailed("zone_ambiguous"); } // 唯一可信分区与关联结果不一致时拒绝继续跟随。
-    }else if(target_mixed != 0 && App_Task_ScatterSceneClear() == 0){ // 保留撞散接口原场景检查；当前绿色选择不自动触发撞散。
+    if(target_mixed != 0 && App_Task_ScatterSceneClear() == 0){
         return App_Task_FollowFailed("scatter_unsafe"); // 撞散用途的整幅场景检查失败时仍报告原原因。
     } // 结束用途检查，普通绿色不再检查相邻实体或拥挤情况。
-    target = *App_Task_ObjectAt(index); // 每帧更新真实检测或重新推导的分区位置。
-    target_zone_derived = target_zone && index >= task_scene.object_count;
-    if(target_zone && App_Task_ZonePathClear() == 0){ return App_Task_FollowFailed("zone_path_blocked"); } // 目的分区通道受阻时报告并停车。
-    if(lost_frames != 0){ // 当前已找回之前短暂丢失的同一目标，执行恢复前的状态清理。
+    target = *App_Task_ObjectAt(index); // 每帧更新已关联的真实物块检测。
+    if(capture){
+        target_image_w = task_scene.image_width;
+        target_image_h = task_scene.image_height;
+    }
+    if(lost_frames != 0 || (capture && green_waiting)){ // 坏图恢复也要求有效新图匹配原目标。
         lost_frames = 0; // 清零原目标连续未匹配的新帧计数。
+        green_waiting = 0;
         App_Task_Move_Stop(); // 撤销位置/角度控制并将左右轮目标速度置零。
         App_LinePID_Reset(); // 清空视觉PID历史误差及死区状态，避免旧输出干扰新阶段。
         return APP_STEP_WAIT; // 找回原目标后保持停车一帧，下一张新图恢复原阶段，不再次原地对准
     } // 结束条件分支。
     y = App_Task_Y(&target); // 取原目标本帧中心y，作为纵向控制和停车判断依据。
-    if(capture){ // 单独绿色目标的XY对准和接近沿用测试版控制行为。
-        if(follow_forward == 0){ // 首次原地对准只用X误差转向，Y轴运动控制从对准完成后开始。
-            if(App_LinePID_InDeadband(App_Task_X(&target))){ // 目标x进入横向死区时结束首次对准。
-                App_Task_Move_Stop(); // 对准阶段结束时停车，避免把转向输出带入平移。
-                App_LinePID_Reset(); // 清除横向PID历史误差及死区状态。
-                follow_forward = 1; // 标记首次对准已完成，进入XY纵向跟随阶段。
-                follow_time = HAL_GetTick(); // 从首次对准完成时开始计算接近阶段超时。
-                capture_y_direction = 0; // 从停车状态开始判定纵向控制方向。
-                capture_y_request = 0; // 清除之前可能遗留的待恢复方向。
-                capture_y_frames = 0; // 重置纵向方向稳定确认帧数。
-                capture_y_wait_time = HAL_GetTick(); // 记录首次平移前的停车等待起点。
-                return APP_STEP_RUNNING; // 下一张新图再开始Y轴方向确认和运动。
-            } // 结束首次对准完成判断。
-            App_Task_VisualDrive(App_Task_X(&target), 0.0f, 0); // 目标尚未对准时仅原地执行X轴视觉PID。
-            return APP_STEP_RUNNING; // 对准阶段不执行前后运动。
-        } // 结束首次原地对准处理。
-        return App_Task_CaptureFollow(App_Task_X(&target), y); // 对准后按测试版Y轴P、滞回和防晃动条件前后调整。
+    if(capture){ // 绿色与整区共用首次X对准及原Y轴P控制。
+        return App_Task_CaptureFollow(App_Task_X(&target), y, LINE_PID_AIM_X, APP_TASK_ARRIVE_X,
+                                      LINE_PID_STOP_Y, LINE_PID_STOP_Y_BAND, &speed);
     } // 结束单独绿色跟随分支。
     if(y >= stop_y && App_Task_Abs(App_Task_X(&target) - APP_TASK_AIM_X) <= APP_TASK_ARRIVE_X){ // 到达中心Y门限且横向进入落框容差后，才开始到位停车复核。
         return App_Task_Arrive(App_Task_X(&target), y); // 停车并复核位置稳定性、连续新帧数及等待时长。
     } // 结束到位位置判断。
-    if(capture == 0 && arrive_frames != 0 && y >= stop_y - APP_TASK_ARRIVE_Y_BACK){ // 物资堆/分区保留原少量回落容差；绿色必须始终处于390～410。
+    if(capture == 0 && arrive_frames != 0 && y >= stop_y - APP_TASK_ARRIVE_Y_BACK){ // 旧物资堆保留原少量回落容差；绿色由上方公共XY控制处理。
         return App_Task_Arrive(App_Task_X(&target), y); // 保持停车并复核目标位置。
     } // 结束复核回落容差判断。
     arrive_frames = 0; // 目标回落或尚未对准时清除旧到位计数。
@@ -759,7 +839,6 @@ App_Task_Result App_Task_Vision_Follow(void) // 函数入口：物块/本队物�
             App_Task_Move_Stop(); // 撤销位置/角度控制并将左右轮目标速度置零。
             App_LinePID_Reset(); // 清空视觉PID历史误差及死区状态，避免旧输出干扰新阶段。
             follow_forward = 1; // 标记已进入持续前进阶段，之后不再返回首次原地对准。
-            follow_time = HAL_GetTick(); // 记录当前首次对准或持续接近阶段的毫秒起点。
             return APP_STEP_RUNNING; // 下一张新图才前进
         } // 结束条件分支。
         speed = 0.0f; // 首次未对准时基础前进速度为零，仅由差速产生原地转向。
@@ -770,16 +849,21 @@ App_Task_Result App_Task_Vision_Follow(void) // 函数入口：物块/本队物�
     return APP_STEP_RUNNING; // 动作仍在进行，主循环需继续调用本函数。
 } // 结束App_Task_Vision_Follow函数体。
 
-// @简介：复检失败时保留窗口和物块现场，停车后打印具体原因。
-static App_Task_Result App_Task_VerifyFailed(const char *reason)
+// @简介：报告本次复检失败并保留现场；任务层缓存终态，落框满500ms后按次数重试或恢复。
+static App_Task_Result App_Task_VerifyFailed(const char *reason, App_Task_VerifyFailure failure)
 {
-    App_Task_Result result = App_Task_Vision_Failed();
-    if(APP_TASK_DEBUG_ENABLE){ App_USART1_Printf("[VERIFY] stop=%s\r\n", reason); }
+    verify_failure = failure;
+    if(APP_TASK_DEBUG_ENABLE){ App_USART1_Printf("[VERIFY] failed=%s\r\n", reason); }
     App_Task_Vision_LogDetails("VERIFY");
-    return result;
+    return APP_STEP_FAILED;
 }
 
-// @简介：收齐三张有效新图后至少一张恰好一个可信绿色才通过；空区域计入窗口，冲突立即失败。
+App_Task_VerifyFailure App_Task_Vision_GetVerifyFailure(void)
+{
+    return verify_failure;
+}
+
+// @简介：收齐三张有效新图后至少一张恰好一个绿色才通过；空区域计入窗口，冲突立即失败。
 App_Task_Result App_Task_Vision_Verify(void)
 {
     int result;
@@ -792,36 +876,34 @@ App_Task_Result App_Task_Vision_Verify(void)
     if(App_Task_NewFrame() == 0){ ++verify_duplicates; verify_wait = "duplicate_frame"; return APP_STEP_WAIT; }
     ++verify_new_total;
     result = App_Task_CheckCargo();
-    if(result < 0){ verify_wait = cargo_reason; return App_Task_VerifyFailed(cargo_reason); }
+    if(result < 0){
+        verify_wait = cargo_reason;
+        return App_Task_VerifyFailed(cargo_reason, cargo_count > 1 ? APP_VERIFY_MULTIPLE : APP_VERIFY_WRONG_TYPE);
+    }
     verify_frames++;
     if(result == 1){ verify_hits++; verify_reported = 0; } // 有效合格图后，再次出现异常时重新提示。
     verify_wait = result == 1 ? "collecting" : "cargo_empty";
     if(result == 0){ App_Task_LogWait("VERIFY", verify_wait, &verify_reported); }
     if(verify_frames < APP_TASK_VERIFY_FRAMES){ return APP_STEP_WAIT; }
-    return verify_hits >= APP_TASK_VERIFY_MIN_HITS ? APP_STEP_DONE : App_Task_VerifyFailed("no_hit_in_window");
+    return verify_hits >= APP_TASK_VERIFY_MIN_HITS ? APP_STEP_DONE
+         : App_Task_VerifyFailed("no_hit_in_window", APP_VERIFY_NO_HIT);
 }
 
-// @简介：持续顺时针寻找本队物资区；有效新图找到后立即锁定，不做3帧等待。
+// @简介：旋转搜索本队整块安全区；找到后停车，下一张新图开始首次X对准。
 App_Task_Result App_Task_Vision_SearchZone(void)
 {
-    if(App_Task_ReadScene() != 0){
-        if(App_Task_NewFrame()){
-            int index = App_Task_FindZone();
-            if(index >= 0){
-                const RescueObject *object = App_Task_ObjectAt((uint8_t)index);
-                App_Task_Move_Stop();
-                if(APP_TASK_DEBUG_ENABLE){
-                    App_USART1_Printf("[ZONE] type=%u xy=(%u,%u) wh=(%u,%u) source=%s\r\n", (unsigned int)object->type,
-                                     (unsigned int)object->cx, (unsigned int)object->cy, (unsigned int)object->width,
-                                     (unsigned int)object->height, index >= task_scene.object_count ? "divider" : "direct");
-                }
-                zone_reported = 0;
-                App_Task_Lock((uint8_t)index, 1, 0);
-                return APP_STEP_DONE;
-            }
-            App_Task_LogWait("ZONE", zone_reason, &zone_reported);
+    if(App_Task_ReadZoneScene() > 0){
+        int index = App_Task_FindWholeZone();
+        if(index >= 0){
+            App_Task_Lock((uint8_t)index, 1, 0);
+            zone_missing = zone_stopped = zone_confirming = 0;
+            zone_confirm_frames = zone_confirm_hits = 0;
+            zone_drive_speed = 0.0f;
+            App_Task_Move_Stop();
+            if(APP_TASK_DEBUG_ENABLE){ App_USART1_Printf("[ZONE] stage=whole whole=%u\r\n", (unsigned int)target.type); }
+            return APP_STEP_DONE;
         }
-    }else { App_Task_LogWait("ZONE", scene_reason, &zone_reported); }
+    }
     App_Task_Move_Speed(APP_TASK_ZONE_SPIN_SPEED, -APP_TASK_ZONE_SPIN_SPEED);
     return APP_STEP_RUNNING;
 }

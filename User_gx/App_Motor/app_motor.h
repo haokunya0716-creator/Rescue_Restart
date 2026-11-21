@@ -35,6 +35,9 @@ void App_Angle_Pro(void);
 /* 任务转向使用可调到位容差和最小单轮速度，避免小误差时输出不足以克服摩擦。 */
 void App_Angle_Pro_Limited(float tolerance_deg, float min_speed);
 
+/* 以给定基础轮速保持 Set_Angle_Target 设置的航向，单位 cm/s。 */
+void App_Heading_Pro(float speed);
+
 /* 执行位置环和角度环联合控制。 */
 void App_Position_Pro(void);
 

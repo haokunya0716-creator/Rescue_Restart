@@ -44,6 +44,10 @@
 #include "oled_hardware_i2c.h"
 #include <stdio.h>
 #include "app_cargo_test.h"
+#include "app_zone_test.h"
+#include "app_zone_y_test.h"
+#include "app_zone_xy_heading_test.h"
+#include "app_vision_test.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -174,6 +178,9 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    //if (App_ZoneXYHeading_Test(APP_TASK_TEAM_RED, 69.9f)) { continue; } // 新XY+固定航向测试；0.0f改为场地标定角，与下方测试仅启用一个。
+    //if (App_ZoneY_Test(APP_TASK_TEAM_RED)) { continue; } // 独立安全区Y轴PID调参；注释本行恢复下方模式。
+    // if (App_Zone_Test(APP_TASK_TEAM_RED)) { continue; } // 原完整安全区XY测试。
     if (key2_flag == 1 || key3_flag == 1) {
       uint8_t team = key3_flag == 1 ? APP_TASK_TEAM_RED : APP_TASK_TEAM_BLUE;
       key2_flag = 0;
@@ -196,6 +203,7 @@ int main(void)
 
     /* 先更新视觉场景，再执行本地任务和当前步骤需要的控制闭环。 */
     Rescue_Usart2_Process();
+    //App_Vision_Test(); // 每50 ms打印视野内全部检测信息；不用时注释本行。
     App_Task_Proc();
     Rescue_Usart2_Debug_Proc(); // 正式模式下串口1报告相机断流超时。
 

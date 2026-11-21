@@ -11,11 +11,14 @@
 // 任务视觉参数统一放在App_Task/app_task_config.h，避免两处修改不一致。
 #include "app_task_config.h"
 
-// @简介：初始化视觉对准 PID，SP 固定为屏幕中心 LINE_PID_AIM_X。
+// @简介：初始化视觉对准 PID，默认目标为绿色中心 LINE_PID_AIM_X，整区调用参数化入口。
 void App_LinePID_Init(void);
 
 // @简介：换目标或首次对准结束时，复位历史误差、积分项和死区状态。
 void App_LinePID_Reset(void);
+
+// 共用横向PID，传入本用途的X目标与进入/退出死区；切换用途前复位历史。
+float App_LinePID_ComputeTarget(float object_cx, float aim_x, float enter, float exit);
 
 // @简介：根据目标中心 x 计算差速修正量，已按死区和符号处理，单位 cm/s。
 float App_LinePID_Compute(float object_cx);

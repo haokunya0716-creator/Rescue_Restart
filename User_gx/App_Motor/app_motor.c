@@ -438,11 +438,18 @@ void App_Angle_Pro_Limited(float tolerance_deg, float min_speed)
     App_Speed_Pro();
 }
 
-/*
- * @简介：执行位置环和角度环联合控制。
- * @参数：无。
- * @返回：无。
- */
+// 以给定基础轮速保持当前角度目标，复用原角度PID。
+void App_Heading_Pro(float speed)
+{
+    App_Update_Data();
+    motor_base_speed = speed;
+    motor_turn_speed = App_Motor_PIDComputeAngle(&pid_angle_yaw,
+                          App_Motor_AngleError(angle_yaw_ref, angle_yaw));
+    App_Speed_Set(speed - motor_turn_speed, speed + motor_turn_speed);
+    App_Speed_Pro();
+}
+
+// 执行原位置环和角度环联合控制。
 void App_Position_Pro(void)
 {
     PERIODIC_START(POSITION,30)

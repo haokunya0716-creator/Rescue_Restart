@@ -33,10 +33,11 @@ void App_LinePID_Reset(void)
 // @返回值：正数表示需要向右修正，负数表示向左，已限幅，单位 cm/s。
 // @说明：使用双门限死区，误差进入内门限停止修正，超过外门限才重新修正。
 //
-static float App_LinePID_ComputeBand(float object_cx, float enter, float exit)
+float App_LinePID_ComputeTarget(float object_cx, float aim_x, float enter, float exit)
 {
-    float error = object_cx - LINE_PID_AIM_X;
+    float error = object_cx - aim_x;
     float turn;
+    PID_ChangeSP(&line_pid, aim_x); // 各用途传入目标，PID系数和计算实现共用。
 
     if(error <= enter && error >= -enter){
         correcting = 0; // 误差足够小，停止修正
@@ -60,13 +61,13 @@ static float App_LinePID_ComputeBand(float object_cx, float enter, float exit)
 // @简介：远处/首次对准使用10/20像素双门限死区，输出左右轮差速修正量。
 float App_LinePID_Compute(float object_cx)
 {
-    return App_LinePID_ComputeBand(object_cx, LINE_PID_DEAD_ENTER, LINE_PID_DEAD_EXIT);
+    return App_LinePID_ComputeTarget(object_cx, LINE_PID_AIM_X, LINE_PID_DEAD_ENTER, LINE_PID_DEAD_EXIT);
 }
 
 // @简介：近处使用7/8像素双门限死区，提早恢复纠偏；不改变前进状态，不原地调整。
 float App_LinePID_ComputeNear(float object_cx)
 {
-    return App_LinePID_ComputeBand(object_cx, LINE_PID_NEAR_ENTER, LINE_PID_NEAR_EXIT);
+    return App_LinePID_ComputeTarget(object_cx, LINE_PID_AIM_X, LINE_PID_NEAR_ENTER, LINE_PID_NEAR_EXIT);
 }
 
 //

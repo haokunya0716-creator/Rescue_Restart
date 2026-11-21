@@ -134,9 +134,3 @@ void App_Task_Camera_Set(uint8_t down) // 函数入口：控制摄像头俯角�
 { // 开始App_Task_Camera_Set函数体。
     App_Servo_SetAngle(&servo_2, down ? SERVO2_DROP : SERVO2_LIFT); // 根据down选择摄像头低头或正常观察角，并同步更新二号舵机结构体。
 } // 结束App_Task_Camera_Set函数体。
-
-// @简介：下一轮搜索入口预留，当前停车保持前框抬起，不自动解锁其它救援目标。
-void App_Task_NextCycle_Proc(void) // 函数入口：下一轮搜索入口预留，当前停车保持前框抬起，不自动解锁其它救援目标。
-{ // 开始App_Task_NextCycle_Proc函数体。
-    // 后续先补充“恰好一个绿色已进入本队物资区围栏内”的送达确认，再接新循环。
-} // 结束App_Task_NextCycle_Proc函数体。

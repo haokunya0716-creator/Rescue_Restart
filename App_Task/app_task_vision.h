@@ -7,28 +7,40 @@
 
 #include "app_task_move.h" // 引入运动动作及统一结果类型。
 
-// @简介：锁存队伍对应物资分区，并复位视觉跟踪；不发送相机命令。
-void App_Task_Vision_Init(uint8_t team); // 声明接口：锁存队伍对应物资分区，并复位视觉跟踪；不发送相机命令。
+typedef enum {
+    APP_VERIFY_NONE = 0,
+    APP_VERIFY_MULTIPLE,
+    APP_VERIFY_WRONG_TYPE,
+    APP_VERIFY_NO_HIT
+} App_Task_VerifyFailure; // 仅报告现有复检失败原因，不增加判断条件。
+
+// @简介：锁存队伍对应整块安全区，并复位视觉跟踪；不发送相机命令。
+void App_Task_Vision_Init(uint8_t team); // 声明接口：锁存队伍对应整块安全区，并复位视觉跟踪；不发送相机命令。
 
 // @简介：停车并开始新视角；angle为摄像头设定俯角，settle_ms为发送新编号前的等待，0表示立即发送。
-void App_Task_Vision_Begin(float angle, uint32_t settle_ms); // 声明接口：启动旋转搜索、复检和物资区搜索传0，撞散重选保留画面稳定等待。
+void App_Task_Vision_Begin(float angle, uint32_t settle_ms); // 复检和整区搜索传0，撞散重选保留画面稳定等待；均先停车。
+
+// @简介：保持当前轮速开始新视角；启动切换、复检重试及恢复重搜传0，不产生切换短停。
+void App_Task_Vision_BeginMoving(float angle, uint32_t settle_ms);
 
 // @简介：从完整新视角中选目标；1已锁定，0连续多张新图无候选，-1继续等待。
-// @说明：初步调试只选可信绿色，不检查相邻物块，也不按相邻关系自动触发撞散。
+// @说明：初步调试只按类型选绿色，不检查置信度或相邻物块，也不按相邻关系自动触发撞散。
 int App_Task_Vision_Select(void); // 声明接口：从完整新视角中选目标；1已锁定，0连续多张新图无候选，-1继续等待。
 
 // @简介：当前锁定是否用于撞散；锁定后保持该用途，不因列表顺序改变而跳目标。
 uint8_t App_Task_Vision_IsMixed(void); // 声明接口：当前锁定是否用于撞散；锁定后保持该用途，不因列表顺序改变而跳目标。
 
-// @简介：首次原地对准+持续差速接近+到位停车多帧复核；DONE时可执行下一机械动作。
-// @说明：物块沿用3帧/600ms丢失处理；安全区失配立即旋转并返回RESEARCH，重新锁定后重新对准。
-App_Task_Result App_Task_Vision_Follow(void); // 声明接口：首次原地对准+持续差速接近+到位停车多帧复核；DONE时可执行下一机械动作。
+// @简介：首次原地对准+持续差速接近+到位停车多帧复核；DONE表示该用途到位确认完成；整区随后保持停车。
+// @说明：普通绿色坏图/失配先停等，确认丢失返回TARGET_LOST由任务层后退重搜；整区共用绿色XY控制；X丢失停车200ms、XY丢失保持300ms再停车300ms，RESEARCH重搜；到位三图至少一张合格才DONE。
+App_Task_Result App_Task_Vision_Follow(void); // 声明接口：首次原地对准+持续差速接近+到位停车多帧复核；DONE表示该用途到位确认完成；整区随后保持停车。
 
-// @简介：摄像头不动，按640×480中心坐标检查三张有效新图，至少一张恰好一个可信绿色才DONE。
-App_Task_Result App_Task_Vision_Verify(void); // 三张均未通过或出现多件/非绿色/低置信冲突返回FAILED，重复帧不计数。
+// @简介：摄像头不动，按640×480中心坐标检查三张有效新图，至少一张恰好一个绿色才DONE。
+App_Task_Result App_Task_Vision_Verify(void); // 三张均未通过或出现多件/非绿色冲突返回FAILED，重复帧不计数。
 
-// @简介：持续寻找本队物资区（直接标签或整体区+分界线推导），有效新图找到即锁定。
-App_Task_Result App_Task_Vision_SearchZone(void); // 声明接口：原地寻找已锁存的本队物资区；DONE时停车并锁定分区供Follow继续接近。
+App_Task_VerifyFailure App_Task_Vision_GetVerifyFailure(void); // 读取本次失败原因，供任务层重试或恢复。
+
+// @简介：旋转寻找本队整块安全区5/6，找到后停车准备首次X对准，不跟随分区或分界线。
+App_Task_Result App_Task_Vision_SearchZone(void); // DONE表示已锁定整区并停车准备首次X对准；Follow在整区三图确认通过时报告DONE，丢失到期/确认失败报告RESEARCH。
 
 // @简介：只读打印最后一次视觉检查现场，用于失败、复检超时及重选结束诊断。
 void App_Task_Vision_LogDetails(const char *stage);

@@ -16,7 +16,8 @@
 #include "tim.h"
 
 Servo_t servo_1;//夹爪舵机
-Servo_t servo_2;//摄像头舵机
+Servo_t servo_2;//摄像头pitch舵机
+Servo_t servo_3;//摄像头yaw舵机
 
 static uint32_t Servo_angle_Compute(float angle_target);
 //
@@ -25,18 +26,21 @@ static uint32_t Servo_angle_Compute(float angle_target);
 void App_Servo_Init(void) {
 
     servo_1.htim = &htim5;
-    servo_1.Channel = TIM_CHANNEL_2;
+    servo_1.Channel = TIM_CHANNEL_1;
 
     servo_2.htim = &htim5;
-    servo_2.Channel = TIM_CHANNEL_3;
+    servo_2.Channel = TIM_CHANNEL_2;
+
+    servo_3.htim = &htim5;
+    servo_3.Channel = TIM_CHANNEL_3;
 
     /* 先加载两路初始脉宽，再开启输出，避免先输出零脉宽。 */
-    App_Servo_SetAngle(&servo_1, 180.0f);
-    App_Servo_SetAngle(&servo_2, 50.0f);
-
+    App_Servo_SetAngle(&servo_1, 120.0f);
+    App_Servo_SetAngle(&servo_2, 48.0f);
+    App_Servo_SetAngle(&servo_3, 95.0f);
     HAL_TIM_PWM_Start(servo_1.htim, servo_1.Channel);
     HAL_TIM_PWM_Start(servo_2.htim, servo_2.Channel);
-
+    HAL_TIM_PWM_Start(servo_3.htim, servo_3.Channel);
 }
 
 //

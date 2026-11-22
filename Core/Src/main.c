@@ -66,7 +66,8 @@ uint8_t rx_byte_imu;   // USART3 接收陀螺仪数据
 float duty_l = 0;
 float duty_r = 0;
 float angle_1 = 0.0f;
-float angle_2 = 0.0f;
+float angle_2 = 48.0f;
+float angle_3 = 95.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -139,6 +140,7 @@ int main(void)
   if (Rescue_Usart2_Start() == 0U) {
     Error_Handler();
   }
+  (void)Rescue_Usart2_SendViewContext(1U, 0);
   App_USART1_Printf("start!\n");
 
   /* USER CODE END 2 */
@@ -147,16 +149,22 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    App_Usart_USB_Process();
+
+    // PERIODIC_START(PRINT,50)
+    // App_USART1_Printf("%d\n",HAL_GetTick());
+    // PERIODIC_END
+
     PERIODIC_START(KEY_DETECT,20)
     App_Button_Proc();
     PERIODIC_END
 
-    PERIODIC_START(PEINT_USART,500)
+    PERIODIC_START(Toggle_LED,500)
     HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
     PERIODIC_END
 
     Rescue_Usart2_Process();
+    App_Vision_Update();
+    App_Task_Pro();
     Rescue_Usart2_Debug_Proc();
 
     /* USER CODE END WHILE */

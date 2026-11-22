@@ -13,8 +13,9 @@ typedef struct {
     float Angle; // 最近一次写入 PWM 的设定角度，单位：度，范围 0～180；不是实测角度
 } Servo_t;
 
-extern Servo_t servo_1; /* 夹爪：TIM5_CH2 / PA1 */
-extern Servo_t servo_2; /* 摄像头：TIM5_CH3 / PA2 */
+extern Servo_t servo_1; /* 夹爪：TIM5_CH1 / PA1 */
+extern Servo_t servo_2; /* 摄像头 pitch：TIM5_CH2 / PA1 */
+extern Servo_t servo_3; /* 摄像头 yaw：TIM5_CH3 / PA2 */
 
 /* MX_TIM5_Init()后调用一次，前框初始化180°、摄像头75°。 */
 void App_Servo_Init(void);

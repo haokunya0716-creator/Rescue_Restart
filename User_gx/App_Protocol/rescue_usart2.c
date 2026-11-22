@@ -7,6 +7,8 @@
 #define RESCUE_INTERBYTE_TIMEOUT_MS 20U
 #define RESCUE_UART_TX_TIMEOUT_MS   30U
 
+AppVisionData app_vision;
+
 typedef struct {
     RescueFrame frame;
     uint32_t received_ms;
@@ -231,6 +233,27 @@ uint8_t Rescue_Usart2_GetScene(RescueScene *out)
     }
     *out = latest_scene;
     return 1U;
+}
+
+void App_Vision_Update(void)
+{
+    RescueScene scene;
+    if (Rescue_Usart2_GetScene(&scene) == 0U) {
+        app_vision.object_count = 0U;
+        return;
+    }
+
+    for (uint8_t i = 0U; i < scene.object_count; ++i) {
+        const RescueObject *object = &scene.objects[i];
+        app_vision.objects[i] = (AppVisionObject){
+            .type = object->type,
+            .cx = object->cx,
+            .cy = object->cy,
+            .width = object->width,
+            .height = object->height
+        };
+    }
+    app_vision.object_count = scene.object_count;
 }
 
 uint8_t Rescue_Usart2_LinkOnline(void)

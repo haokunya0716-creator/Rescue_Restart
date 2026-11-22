@@ -395,14 +395,17 @@ void Set_Position_Angle_SP(float position_ref, float angle_ref)
     motor_angle_done = 0;
 }
 
-/*
- * @简介：执行角度环控制，并驱动小车原地转向。
- * @参数：无。
- * @返回：无。
+/**
+ * @brief 更新原地转向控制，返回最近一次角度到位状态。
+ *
+ * @return 0：尚未到位；1：已进入当前设置的到位容差。
+ * @pre 已通过角度目标设置接口下发本次目标。
  */
-void App_Angle_Pro(void)
+uint8_t App_Angle_Pro(void)
 {
-    App_Angle_Pro_Limited(1.0f, 0.0f);
+    App_Angle_Pro_Limited(4.0f, 0.0f);
+
+    return motor_angle_done;
 }
 
 // @简介：沿用角度PID；到位范围内停车，范围外的单轮速度不低于指定下限。

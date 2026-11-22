@@ -37,6 +37,21 @@ uint8_t Rescue_Usart2_SendFrame(const RescueFrame *frame);
  */
 uint8_t Rescue_Usart2_GetScene(RescueScene *out);
 
+typedef struct {
+    uint8_t type;
+    uint16_t cx, cy;
+    uint16_t width, height;
+} AppVisionObject;
+
+typedef struct {
+    uint8_t object_count;
+    AppVisionObject objects[RESCUE_MAX_OBJECTS];
+} AppVisionData;
+
+/* 主循环在 Rescue_Usart2_Process() 后更新。读取下标范围为 0 到 object_count - 1。 */
+extern AppVisionData app_vision;
+void App_Vision_Update(void);
+
 /* 在线心跳和视觉帧均可证明链路在线；心跳不能让旧图像继续有效。 */
 uint8_t Rescue_Usart2_LinkOnline(void);
 
